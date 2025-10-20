@@ -10,6 +10,7 @@ import cv2
 import matplotlib.pyplot as plt
 import numpy as np
 from matplotlib.patches import Rectangle
+import torch
 from detectron2 import model_zoo
 from detectron2.config import get_cfg
 from detectron2.data import DatasetCatalog, MetadataCatalog
@@ -275,7 +276,12 @@ class UterusSegmentationTrainer:
         Path(self.cfg.OUTPUT_DIR).mkdir(parents=True, exist_ok=True)
         
         # Set device to CPU for macOS compatibility
-        self.cfg.MODEL.DEVICE = "cpu"
+        device = "cuda" if torch.cuda.is_available() else "cpu"
+        if device == "cuda" and torch.cuda.device_count() > 1:
+            # Detectron2 gère automatiquement les GPU multiples via launch, mais on peut
+            # afficher l'information pour transparence.
+            print(f"Utilisation de {torch.cuda.device_count()} GPU(s)")
+        self.cfg.MODEL.DEVICE = device
         
         # Evaluation cadence for early stopping
         self.cfg.TEST.EVAL_PERIOD = 200
