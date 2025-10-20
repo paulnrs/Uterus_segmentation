@@ -38,8 +38,8 @@ pip install opencv-python pillow matplotlib pycocotools tensorboard pandas sciki
 ### 1.6 Configuration Matplotlib (macOS)
 Matplotlib peut échouer si `~/.matplotlib` n'est pas accessible ou si aucun backend graphique n'est disponible.
 ```bash
-mkdir -p /Users/lotfi/FEMNOV/mpl_cache
-export MPLCONFIGDIR=/Users/lotfi/FEMNOV/mpl_cache
+mkdir -p /FEMNOV/mpl_cache
+export MPLCONFIGDIR=/FEMNOV/mpl_cache
 export MPLBACKEND=Agg
 ```
 Ces variables peuvent être définies dans le shell avant tout lancement du script d'entraînement.
@@ -74,7 +74,7 @@ FEMNOV/
     └── PROJET_UTERUS.md          # rapport courant
 ```
 
-Les images proviennent de `/Users/lotfi/Downloads/13k_images/images/augmentations`. Répartition effectuée avec une graine fixe (42) via un script Python qui copie 1605 fichiers en train, 200 en validation et 200 en test.
+Les images proviennent de `13k_images/images/augmentations`. Répartition effectuée avec une graine fixe (42) via un script Python qui copie 1605 fichiers en train, 200 en validation et 200 en test.
 
 Les annotations COCO ont été reconstruites par split à partir de `annotations/instances_Train_augmented.json` du dataset source avec remappage des identifiants et uniformisation de la catégorie (`"uterus"`).
 
@@ -82,7 +82,7 @@ Les annotations COCO ont été reconstruites par split à partir de `annotations
 
 Étapes réalisées pour aligner les annotations avec les nouvelles répartitions :
 1. Suppression préalable des images dans `data/train|val|test/images`.
-2. Copie 80/10/10 depuis `/Users/lotfi/Downloads/13k_images/images/augmentations`.
+2. Copie 80/10/10 depuis `13k_images/images/augmentations`.
 3. Génération de nouveaux `annotations.json` en ne conservant que les entrées correspondant aux images présentes. Les champs `id`, `image_id`, `file_name` et la catégorie `"uterus"` sont régénérés/normalisés.
 4. Ajustement final des noms de catégorie (`"uterus"` en minuscule) pour respecter les contraintes Detectron2.
 
@@ -145,7 +145,7 @@ validator.visualize_samples()
 
 Exécution :
 ```bash
-MPLCONFIGDIR=/Users/lotfi/FEMNOV/mpl_cache MPLBACKEND=Agg \
+MPLCONFIGDIR=/FEMNOV/mpl_cache MPLBACKEND=Agg \
 python data/scripts/train.py
 ```
 
