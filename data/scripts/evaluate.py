@@ -34,14 +34,14 @@ class ModelEvaluator:
 
         if "segm" in results:
             segm = results["segm"]
-            print("\n📊 Résultats de segmentation:")
+            print("\n Résultats de segmentation:")
             print(f"   • AP (IoU=0.50:0.95): {segm['AP']:.2f}")
             print(f"   • AP50: {segm['AP50']:.2f}")
             print(f"   • AP75: {segm['AP75']:.2f}")
 
         if "bbox" in results:
             bbox = results["bbox"]
-            print("\n📊 Résultats de détection (bbox):")
+            print("\n Résultats de détection (bbox):")
             print(f"   • AP (IoU=0.50:0.95): {bbox['AP']:.2f}")
             print(f"   • AP50: {bbox['AP50']:.2f}")
             print(f"   • AP75: {bbox['AP75']:.2f}")
@@ -63,7 +63,7 @@ class ModelEvaluator:
 
         if save_path:
             cv2.imwrite(str(save_path), result_img)
-            print(f"✅ Prédiction sauvegardée: {save_path}")
+            print(f" Prédiction sauvegardée: {save_path}")
 
         return result_img
 
