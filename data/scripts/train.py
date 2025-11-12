@@ -253,7 +253,7 @@ class UterusSegmentationTrainer:
         self.cfg.SOLVER.IMS_PER_BATCH = 16
         self.cfg.SOLVER.BASE_LR = 0.0005  # learning rate augmenté
         self.cfg.SOLVER.MAX_ITER = 1000
-        self.cfg.SOLVER.STEPS = [1200, 1600]
+        self.cfg.SOLVER.STEPS = [600, 800]
         self.cfg.SOLVER.GAMMA = 0.1
 
         self.cfg.INPUT.MIN_SIZE_TRAIN = (640, 672, 704, 736, 768, 800)
