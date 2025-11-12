@@ -228,7 +228,7 @@ class UterusSegmentationTrainer:
         if device == "cuda" and torch.cuda.device_count() > 1:
             print(f"Utilisation de {torch.cuda.device_count()} GPU(s)")
         self.cfg.MODEL.DEVICE = device
-        self.cfg.TEST.EVAL_PERIOD = 400
+        self.cfg.TEST.EVAL_PERIOD = 200
         if params:
             for key, value in params.items():
                 setattr(self.cfg, key, value)
@@ -252,45 +252,42 @@ class UterusSegmentationTrainer:
         print("Datasets enregistrés avec succès")
 
     def train(self) -> DefaultTrainer:
-      print("\n" + "=" * 60)
-      print("DÉBUT DE L'ENTRAÎNEMENT")
-      print("=" * 60)
+        print("\n" + "=" * 60)
+        print("DÉBUT DE L'ENTRAÎNEMENT")
+        print("=" * 60)
+        early_stopping_cfg = {
+            "patience": 80,
+            "maximize": False,
+            "min_delta": 1e-4,
+            "warmup_iters": self.cfg.TEST.EVAL_PERIOD,
+        }
+        trainer = EarlyStoppingTrainerWithCheckpoints(
+            self.cfg, early_stopping=early_stopping_cfg, save_every_n_iters=400
+        )
+        trainer.resume_or_load(resume=False)
 
-      early_stopping_cfg = {
-          "patience": 80,
-          "maximize": False,
-          "min_delta": 1e-4,
-          "warmup_iters": 200,  # correspond à TEST.EVAL_PERIOD
-      }
+        class ValMetricsHook(hooks.HookBase):
+            def after_step(self):
+                if (self.trainer.iter + 1) % self.trainer.cfg.TEST.EVAL_PERIOD == 0:
+                    val_loader = build_detection_test_loader(self.trainer.cfg, "uterus_val")
+                    evaluator = COCOEvaluator("uterus_val", self.trainer.cfg, False, output_dir=self.trainer.cfg.OUTPUT_DIR)
+                    metrics = inference_on_dataset(self.trainer.model, val_loader, evaluator)
+                    print(f"\n--- Validation metrics at iter {self.trainer.iter} ---")
+                    print(metrics)
+                    print("-----------------------------------------------\n")
+                    self.trainer.checkpointer.save(f"model_{self.trainer.iter+1}")
 
-      trainer = EarlyStoppingTrainerWithCheckpoints(
-          self.cfg, early_stopping=early_stopping_cfg, save_every_n_iters=200
-      )
-      trainer.resume_or_load(resume=False)
+        trainer.register_hooks([ValMetricsHook()])
 
-      class ValMetricsHook(hooks.HookBase):
-          def after_step(self):
-              if (self.trainer.iter + 1) % 200 == 0:  # validation toutes les 200 itérations
-                  val_loader = build_detection_test_loader(self.trainer.cfg, "uterus_val")
-                  evaluator = COCOEvaluator("uterus_val", self.trainer.cfg, False, output_dir=self.trainer.cfg.OUTPUT_DIR)
-                  metrics = inference_on_dataset(self.trainer.model, val_loader, evaluator)
-                  print(f"\n--- Validation metrics at iter {self.trainer.iter} ---")
-                  print(metrics)
-                  print("-----------------------------------------------\n")
-                  # Sauvegarde après validation
-                  self.trainer.checkpointer.save(f"model_{self.trainer.iter+1}")
+        print(f"\nEntraînement sur {self.cfg.SOLVER.MAX_ITER} itérations...")
+        print(f"   Learning Rate: {self.cfg.SOLVER.BASE_LR}")
+        print(f"   Batch Size: {self.cfg.SOLVER.IMS_PER_BATCH}")
+        print(f"   Output: {self.cfg.OUTPUT_DIR}")
 
-      trainer.register_hooks([ValMetricsHook()])
-
-      print(f"\nEntraînement sur {self.cfg.SOLVER.MAX_ITER} itérations...")
-      print(f"   Learning Rate: {self.cfg.SOLVER.BASE_LR}")
-      print(f"   Batch Size: {self.cfg.SOLVER.IMS_PER_BATCH}")
-      print(f"   Output: {self.cfg.OUTPUT_DIR}")
-
-      trainer.train()
-      trainer.checkpointer.save("model_final")
-      print("\nEntraînement terminé ! Checkpoint final sauvegardé.")
-      return trainer
+        trainer.train()
+        trainer.checkpointer.save("model_final")
+        print("\nEntraînement terminé ! Checkpoint final sauvegardé.")
+        return trainer
 
 # ====================
 # PIPELINE PRINCIPALE
@@ -342,3 +339,4 @@ if __name__ == "__main__":
             print(f"Score max: {test_result['scores'].max():.3f}")
     else:
         print("Aucune image 'sample.jpg' trouvée dans data/test/images")
+
