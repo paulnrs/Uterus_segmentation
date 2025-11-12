@@ -72,9 +72,11 @@ class EarlyStoppingHook(hooks.HookBase):
 
         self._bad_epochs += 1
         if self._bad_epochs >= self.patience:
-            print(f"\nEarly stopping triggered at iter {self.trainer.iter} (best total_loss: {self._best_score:.4f})")
+            print(f"\n🛑 Early stopping triggered at iter {self.trainer.iter} (best total_loss: {self._best_score:.4f})")
             self.trainer.checkpointer.save("model_early_stopped")
-            self.trainer.iter = self.trainer.max_iter
+            
+            # Provoque un arrêt propre du training
+            raise hooks.StopTrainingException("Early stopping triggered — stopping training early.")
 
 # ====================
 # TRAINER AVEC CHECKPOINTS
