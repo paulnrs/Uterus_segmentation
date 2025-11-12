@@ -28,26 +28,14 @@ from evaluate import ModelEvaluator, UterusSegmentationInference
 # EARLY STOPPING HOOK
 # ====================
 class EarlyStoppingHook(hooks.HookBase):
-    """Hook that stops training when the total_loss stops improving."""
-
-    def __init__(self, patience: int, *, maximize: bool = False, min_delta: float = 0.0, warmup_iters: int = 0):
-        self.patience = patience
-        self.maximize = maximize
-        self.min_delta = min_delta
-        self.warmup_iters = warmup_iters
-
-        self._best_score: Optional[float] = None
-        self._best_iter: int = -1
-        self._bad_epochs: int = 0
+    """Hook that stops training when the total_loss stops improving,
+    and saves the best model observed so far.
+    """
+    # ... (le reste de __init__ reste inchangé) ...
 
     def after_step(self) -> None:
         storage = self.trainer.storage
-        try:
-            history = storage.history("total_loss")
-        except KeyError:
-            return
-        if not history:
-            return
+        # ... (code de récupération de la perte total) ...
 
         score = history.latest()  # total_loss
         eval_iter = self.trainer.iter
@@ -55,6 +43,8 @@ class EarlyStoppingHook(hooks.HookBase):
         if self._best_score is None:
             self._best_score = score
             self._best_iter = eval_iter
+            # Nouvelle ligne: Sauvegarde le premier bon point de départ
+            self.trainer.checkpointer.save("model_best_loss") 
             return
 
         improvement = (
@@ -65,6 +55,9 @@ class EarlyStoppingHook(hooks.HookBase):
             self._best_score = score
             self._best_iter = eval_iter
             self._bad_epochs = 0
+            
+            # Nouvelle logique: Sauvegarde le modèle uniquement si la perte s'améliore
+            self.trainer.checkpointer.save("model_best_loss") 
             return
 
         if eval_iter < self.warmup_iters:
@@ -72,8 +65,10 @@ class EarlyStoppingHook(hooks.HookBase):
 
         self._bad_epochs += 1
         if self._bad_epochs >= self.patience:
-            print(f"\n🛑 Early stopping triggered at iter {self.trainer.iter} (best total_loss: {self._best_score:.4f})")
-            self.trainer.checkpointer.save("model_early_stopped")
+            print(f"\n Early stopping triggered at iter {self.trainer.iter} (best total_loss: {self._best_score:.4f})")
+            
+            # Ligne commentée / retirée: Nous ne sauvegardons plus ici
+            # self.trainer.checkpointer.save("model_early_stopped") 
             
             # Provoque un arrêt propre du training
             raise hooks.StopTrainingException("Early stopping triggered — stopping training early.")
@@ -257,7 +252,7 @@ class UterusSegmentationTrainer:
 
         self.cfg.SOLVER.IMS_PER_BATCH = 16
         self.cfg.SOLVER.BASE_LR = 0.0005  # learning rate augmenté
-        self.cfg.SOLVER.MAX_ITER = 2000
+        self.cfg.SOLVER.MAX_ITER = 1000
         self.cfg.SOLVER.STEPS = [1200, 1600]
         self.cfg.SOLVER.GAMMA = 0.1
 
@@ -360,7 +355,7 @@ class UterusSegmentationTrainer:
         trainer.train()
 
         # Checkpoint final
-        trainer.checkpointer.save("model_final")
+        #trainer.checkpointer.save("model_final")
         print("\nEntraînement terminé ! Checkpoint final sauvegardé.")
 
         return trainer
@@ -414,7 +409,7 @@ if __name__ == "__main__":
 
     print("\nTest d'inférence sur nouvelle image...")
     inference = UterusSegmentationInference(
-        model_path="output/model_final.pth",
+        model_path="output/model_best_loss.pth",
         config_path="output/config.yaml",
     )
 
