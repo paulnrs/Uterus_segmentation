@@ -274,7 +274,7 @@ class UterusSegmentationTrainer:
                     print(f"\n--- Validation metrics at iter {self.trainer.iter} ---")
                     print(metrics)
                     print("-----------------------------------------------\n")
-                trainer.checkpointer.save("model_iter_{:07d}".format(self.trainer.iter + 1))
+                    
 
         trainer.register_hooks([ValMetricsHook()])
 
