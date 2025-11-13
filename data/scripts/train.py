@@ -211,7 +211,6 @@ class UterusSegmentationTrainer:
         self.cfg.SOLVER.IMS_PER_BATCH = 16
         self.cfg.SOLVER.BASE_LR = 0.0005
         self.cfg.SOLVER.MAX_ITER = 1000
-        self.cfg.SOLVER.STEPS = [600, 800]
         self.cfg.SOLVER.GAMMA = 0.1
         self.cfg.INPUT.MIN_SIZE_TRAIN = (640, 672, 704, 736, 768, 800)
         self.cfg.INPUT.MIN_SIZE_TEST = 800
@@ -228,7 +227,7 @@ class UterusSegmentationTrainer:
         if device == "cuda" and torch.cuda.device_count() > 1:
             print(f"Utilisation de {torch.cuda.device_count()} GPU(s)")
         self.cfg.MODEL.DEVICE = device
-        self.cfg.TEST.EVAL_PERIOD = 200
+        self.cfg.TEST.EVAL_PERIOD = 400
         if params:
             for key, value in params.items():
                 setattr(self.cfg, key, value)
@@ -275,7 +274,7 @@ class UterusSegmentationTrainer:
                     print(f"\n--- Validation metrics at iter {self.trainer.iter} ---")
                     print(metrics)
                     print("-----------------------------------------------\n")
-                    self.trainer.checkpointer.save(f"model_{self.trainer.iter+1}")
+                trainer.checkpointer.save("model_iter_{:07d}".format(self.trainer.iter + 1))
 
         trainer.register_hooks([ValMetricsHook()])
 
@@ -306,7 +305,8 @@ def main_training_pipeline() -> Tuple[UterusSegmentationTrainer, ModelEvaluator,
     trainer = UterusSegmentationTrainer()
     print("   Utilisation des données fournies")
     trainer.register_datasets(TRAIN_ANNOTATIONS, TRAIN_IMAGES, VAL_ANNOTATIONS, VAL_IMAGES)
-
+    print("Warmup iters:", trainer.cfg.SOLVER.WARMUP_ITERS)
+    print("Warmup factor:", trainer.cfg.SOLVER.WARMUP_FACTOR)
     print("\nÉTAPE 3: Entraînement du modèle")
     trainer_instance = trainer.train()
 
@@ -339,4 +339,5 @@ if __name__ == "__main__":
             print(f"Score max: {test_result['scores'].max():.3f}")
     else:
         print("Aucune image 'sample.jpg' trouvée dans data/test/images")
+
 
