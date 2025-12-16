@@ -362,8 +362,9 @@ class UterusSegmentationTrainer:
         print("=" * 60)
 
         trainer = DiceTrainer(
-            cfg=self.cfg, val_json=self.val_json, eval_period=200, patience=5
-        )
+    cfg=self.cfg, val_json=self.val_json, eval_period=200
+)
+
         trainer.resume_or_load(resume=False)
 
         print(f"\nEntraînement sur {self.cfg.SOLVER.MAX_ITER} itérations...")
