@@ -16,6 +16,7 @@ from detectron2.data import DatasetCatalog, MetadataCatalog
 from detectron2.data.datasets import register_coco_instances
 from detectron2.engine import DefaultTrainer, hooks
 from pycocotools.coco import COCO
+from tqdm import tqdm
 
 from evaluate import UterusSegmentationInference
 
