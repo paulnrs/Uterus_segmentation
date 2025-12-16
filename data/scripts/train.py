@@ -35,13 +35,7 @@ def calculate_dice_score(pred_mask: np.ndarray, gt_mask: np.ndarray) -> float:
 # Validation Hook
 # ====================
 class DiceValidationHook(hooks.HookBase):
-    def __init__(
-        self,
-        eval_period: int,
-        val_dataset_name: str,
-        val_annotations_path: str,
-        score_thresh: float = 0.5,
-    ):
+    def __init__(self, eval_period: int, val_dataset_name: str, val_annotations_path: str, score_thresh: float = 0.5):
         self.eval_period = eval_period
         self.val_dataset_name = val_dataset_name
         self.coco = COCO(val_annotations_path)
@@ -62,8 +56,10 @@ class DiceValidationHook(hooks.HookBase):
         next_iter = self.trainer.iter + 1
         if next_iter % self.eval_period != 0:
             return
+
+        # Sauvegarde du modèle courant pour validation
         self.trainer.checkpointer.save("model_for_validation")
-        
+
         if self.predictor is None:
             self._build_predictor()
 
@@ -98,12 +94,15 @@ class DiceValidationHook(hooks.HookBase):
             dice_scores.append(dice)
 
         mean_dice = float(np.mean(dice_scores)) if dice_scores else 0.0
-
         self.trainer.storage.put_scalar("validation/dice_score", mean_dice)
 
+        # Sauvegarde seulement si le Dice s'améliore
         if mean_dice > self._best_dice:
+            print(f"Validation Dice amélioré : {self._best_dice:.4f} → {mean_dice:.4f}")
             self._best_dice = mean_dice
             self.trainer.checkpointer.save(f"model_best_dice_{mean_dice:.4f}")
+        else:
+            print(f"Validation Dice pas amélioré ({mean_dice:.4f} <= {self._best_dice:.4f})")
 
         self.trainer.model.train()
 
@@ -112,12 +111,10 @@ class DiceValidationHook(hooks.HookBase):
 # Early Stopping Hook
 # ====================
 class DiceEarlyStoppingHook(hooks.HookBase):
-    def __init__(self, patience: int = 5, min_delta: float = 0.001):
+    def __init__(self, patience: int = 5):
         self.patience = patience
-        self.min_delta = min_delta
-        self._best_dice = None
+        self._best_dice = 0.0
         self._best_iter = -1
-        self._bad_evals = 0
 
     def after_step(self):
         try:
@@ -135,29 +132,24 @@ class DiceEarlyStoppingHook(hooks.HookBase):
             self._best_iter = current_iter
             return
 
-        if dice_score > self._best_dice + self.min_delta:
+        if dice_score > self._best_dice:
             print(f" Amélioration: {self._best_dice:.4f} → {dice_score:.4f}")
             self._best_dice = dice_score
             self._best_iter = current_iter
-            self._bad_evals = 0
+
         else:
-            self._bad_evals += 1
-            print(f" Pas d'amélioration ({self._bad_evals}/{self.patience})")
-
-            if self._bad_evals >= self.patience:
-                print(f"\n{'='*60}")
-                print(f"EARLY STOPPING")
-                print(f"Best Dice: {self._best_dice:.4f} (iter {self._best_iter})")
-                print(f"{'='*60}\n")
-                self.trainer.checkpointer.save("model_early_stopped")
-                self.trainer._stop_training = True
-
+            print(f"\n{'='*60}")
+            print(f"EARLY STOPPING")
+            print(f"Best Dice: {self._best_dice:.4f} (iter {self._best_iter})")
+            print(f"{'='*60}\n")
+            self.trainer.checkpointer.save("model_early_stopped")
+            self.trainer._stop_training = True
 
 # ====================
 # TRAINER AVEC CHECKPOINTS
 # ====================
 class DiceTrainer(DefaultTrainer):
-    def __init__(self, cfg, val_json, eval_period: int = 200, patience: int = 5):
+    def __init__(self, cfg, val_json, eval_period: int = 100, patience: int = 5):
         self.eval_period = eval_period
         self.patience = patience
         self.val_json = val_json
@@ -175,7 +167,7 @@ class DiceTrainer(DefaultTrainer):
 )
 
         hooks_list.append(
-            DiceEarlyStoppingHook(patience=self.patience, min_delta=0.001)
+            DiceEarlyStoppingHook(patience=self.patience)
         )
         hooks_list.append(
             hooks.PeriodicCheckpointer(
