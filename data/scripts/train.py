@@ -16,6 +16,7 @@ from detectron2.data import DatasetCatalog, MetadataCatalog
 from detectron2.data.datasets import register_coco_instances
 from detectron2.engine import DefaultTrainer, hooks
 from pycocotools.coco import COCO
+from pycocotools import mask as mask_util
 from tqdm import tqdm
 
 from evaluate import UterusSegmentationInference
@@ -37,82 +38,119 @@ def calculate_dice_score(pred_mask: np.ndarray, gt_mask: np.ndarray) -> float:
 # ====================
 class DiceValidationHook(hooks.HookBase):
     """
-    Exécute la validation toutes les `eval_period` itérations et sauvegarde
-    le modèle seulement si le Dice s'améliore.
-    Gère polygones et RLE correctement pour éviter Dice = 0.
+    Exécute la validation toutes les `eval_period` itérations.
+    Sauvegarde le modèle seulement si le Dice s'améliore.
     """
     def __init__(self, eval_period: int, val_dataset_name: str, score_thresh: float = 0.5):
         self.eval_period = eval_period
         self.val_dataset_name = val_dataset_name
         self.score_thresh = score_thresh
         self._best_dice = 0.0
-        self.predictor = None
-
-    def _build_predictor(self):
-        from detectron2.engine import DefaultPredictor
-        cfg = self.trainer.cfg.clone()
-        cfg.MODEL.WEIGHTS = self.trainer.checkpointer.get_checkpoint_file()
-        cfg.MODEL.ROI_HEADS.SCORE_THRESH_TEST = self.score_thresh
-        cfg.MODEL.DEVICE = self.trainer.cfg.MODEL.DEVICE
-        self.predictor = DefaultPredictor(cfg)
 
     def after_step(self):
-        # Validation périodique
+        """Appelé après chaque itération d'entraînement."""
         next_iter = self.trainer.iter + 1
+        
+        # Validation périodique uniquement
         if next_iter % self.eval_period != 0:
             return
 
-        if self.predictor is None:
-            self._build_predictor()
-
+        # Passer en mode évaluation
+        self.trainer.model.eval()
+        
         dataset_dicts = DatasetCatalog.get(self.val_dataset_name)
         dice_scores = []
 
-        self.trainer.model.eval()
-        for data in tqdm(dataset_dicts, desc="Validation Dice"):
-            img = cv2.imread(data["file_name"])
-            if img is None:
-                continue
+        with torch.no_grad():  # Désactiver les gradients pour l'inférence
+            for data in tqdm(dataset_dicts, desc="Validation Dice"):
+                img_path = data["file_name"]
+                img = cv2.imread(img_path)
+                
+                if img is None:
+                    print(f" Image introuvable: {img_path}")
+                    continue
 
-            outputs = self.predictor(img)["instances"].to("cpu")
+                # IMPORTANT: Convertir BGR → RGB si nécessaire
+                if self.trainer.cfg.INPUT.FORMAT == "RGB":
+                    img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
 
-            # Masque prédiction
-            pred_mask = np.zeros(img.shape[:2], dtype=bool)
-            if len(outputs) > 0:
-                for m in outputs.pred_masks.numpy():
-                    pred_mask |= m
+                height, width = img.shape[:2]
 
-            # Masque vérité terrain
-            true_mask = np.zeros(img.shape[:2], dtype=bool)
-            for ann in data.get("annotations", []):
-                segm = ann["segmentation"]
-                if isinstance(segm, dict):  # RLE
-                    m = mask_util.decode(segm)
-                else:  # polygones
-                    m = np.zeros(img.shape[:2], dtype=np.uint8)
-                    for poly in segm:
-                        poly_np = np.array(poly).reshape(-1, 2)
-                        cv2.fillPoly(m, [poly_np.astype(np.int32)], 1)
-                true_mask |= m.astype(bool)
+                # Préparer l'input comme le fait Detectron2
+                inputs = [{"image": torch.as_tensor(img.transpose(2, 0, 1).astype("float32")),
+                          "height": height,
+                          "width": width}]
+                
+                # Inférence directe avec le modèle
+                outputs = self.trainer.model(inputs)[0]["instances"].to("cpu")
 
-            # Dice
-            intersection = (pred_mask & true_mask).sum()
-            union = pred_mask.sum() + true_mask.sum()
-            dice = (2 * intersection + 1e-6) / (union + 1e-6)
-            dice_scores.append(dice)
+                # ===== MASQUE DE PRÉDICTION =====
+                pred_mask = np.zeros((height, width), dtype=bool)
+                if len(outputs) > 0:
+                    # Filtrer par score de confiance
+                    high_conf = outputs.scores > self.score_thresh
+                    if high_conf.sum() > 0:
+                        masks = outputs.pred_masks[high_conf].numpy()
+                        for m in masks:
+                            pred_mask |= m
 
+                # ===== MASQUE GROUND TRUTH =====
+                true_mask = np.zeros((height, width), dtype=bool)
+                for ann in data.get("annotations", []):
+                    segm = ann["segmentation"]
+                    
+                    # Gérer RLE
+                    if isinstance(segm, dict):
+                        m = mask_util.decode(segm)
+                    
+                    # Gérer polygones
+                    elif isinstance(segm, list):
+                        m = np.zeros((height, width), dtype=np.uint8)
+                        for poly in segm:
+                            if len(poly) >= 6:  # Au moins 3 points
+                                poly_np = np.array(poly).reshape(-1, 2)
+                                cv2.fillPoly(m, [poly_np.astype(np.int32)], 1)
+                    else:
+                        continue
+                    
+                    true_mask |= m.astype(bool)
+
+                # ===== CALCUL DU DICE =====
+                intersection = (pred_mask & true_mask).sum()
+                union = pred_mask.sum() + true_mask.sum()
+                
+                if union > 0:
+                    dice = (2.0 * intersection) / union
+                else:
+                    # Si pas d'annotation ET pas de prédiction → parfait
+                    dice = 1.0 if pred_mask.sum() == 0 else 0.0
+                
+                dice_scores.append(dice)
+
+        # Calculer la moyenne
         mean_dice = float(np.mean(dice_scores)) if dice_scores else 0.0
+        
+        # Logger dans TensorBoard
         self.trainer.storage.put_scalar("validation/dice_score", mean_dice)
-
-        # Sauvegarde si amélioration
+        
+        print(f"\n{'='*60}")
+        print(f"Validation @ iter {next_iter}")
+        print(f"  Dice Score: {mean_dice:.4f}")
+        print(f"  Samples: {len(dice_scores)}")
+        
+        # Sauvegarde conditionnelle
         if mean_dice > self._best_dice:
-            print(f"\nValidation Dice amélioré : {self._best_dice:.4f} → {mean_dice:.4f}")
+            print(f"  Amélioration ! {self._best_dice:.4f} → {mean_dice:.4f}")
             self._best_dice = mean_dice
-            self.trainer.checkpointer.save(f"model_best_dice_{mean_dice:.4f}")
+            self.trainer.checkpointer.save(f"model_best_dice")
         else:
-            print(f"\nValidation Dice pas amélioré ({mean_dice:.4f} <= {self._best_dice:.4f})")
+            print(f"   Pas d'amélioration ({mean_dice:.4f} <= {self._best_dice:.4f})")
+        
+        print(f"{'='*60}\n")
 
+        # Retour en mode entraînement
         self.trainer.model.train()
+
 
 
 
