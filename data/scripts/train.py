@@ -38,18 +38,17 @@ class DiceValidationHook(hooks.HookBase):
     """
     Exécute la validation toutes les `eval_period` itérations et sauvegarde
     le modèle seulement si le Dice s'améliore.
+    Gère polygones et RLE correctement pour éviter Dice = 0.
     """
-    def __init__(self, eval_period: int, val_dataset_name: str, val_annotations_path: str, score_thresh: float = 0.5):
+    def __init__(self, eval_period: int, val_dataset_name: str, score_thresh: float = 0.5):
         self.eval_period = eval_period
         self.val_dataset_name = val_dataset_name
-        self.coco = COCO(val_annotations_path)
         self.score_thresh = score_thresh
         self._best_dice = 0.0
         self.predictor = None
 
     def _build_predictor(self):
         from detectron2.engine import DefaultPredictor
-
         cfg = self.trainer.cfg.clone()
         cfg.MODEL.WEIGHTS = self.trainer.checkpointer.get_checkpoint_file()
         cfg.MODEL.ROI_HEADS.SCORE_THRESH_TEST = self.score_thresh
@@ -57,47 +56,54 @@ class DiceValidationHook(hooks.HookBase):
         self.predictor = DefaultPredictor(cfg)
 
     def after_step(self):
+        # Validation périodique
         next_iter = self.trainer.iter + 1
         if next_iter % self.eval_period != 0:
-            return  # Sort si ce n'est pas le moment de valider
-
-        # Sauvegarde du modèle courant pour validation
-        self.trainer.checkpointer.save("model_for_validation")
+            return
 
         if self.predictor is None:
             self._build_predictor()
 
-        dataset = DatasetCatalog.get(self.val_dataset_name)
+        dataset_dicts = DatasetCatalog.get(self.val_dataset_name)
         dice_scores = []
 
         self.trainer.model.eval()
-        for data in dataset:
+        for data in tqdm(dataset_dicts, desc="Validation Dice"):
             img = cv2.imread(data["file_name"])
             if img is None:
                 continue
 
             outputs = self.predictor(img)["instances"].to("cpu")
+
+            # Masque prédiction
             pred_mask = np.zeros(img.shape[:2], dtype=bool)
             if len(outputs) > 0:
                 for m in outputs.pred_masks.numpy():
                     pred_mask |= m
 
-            gt_mask = np.zeros(img.shape[:2], dtype=bool)
-            img_id = data["image_id"]
-            ann_ids = self.coco.getAnnIds(imgIds=img_id)
-            anns = self.coco.loadAnns(ann_ids)
-            for ann in anns:
-                gt_mask |= self.coco.annToMask(ann).astype(bool)
+            # Masque vérité terrain
+            true_mask = np.zeros(img.shape[:2], dtype=bool)
+            for ann in data.get("annotations", []):
+                segm = ann["segmentation"]
+                if isinstance(segm, dict):  # RLE
+                    m = mask_util.decode(segm)
+                else:  # polygones
+                    m = np.zeros(img.shape[:2], dtype=np.uint8)
+                    for poly in segm:
+                        poly_np = np.array(poly).reshape(-1, 2)
+                        cv2.fillPoly(m, [poly_np.astype(np.int32)], 1)
+                true_mask |= m.astype(bool)
 
-            intersection = (pred_mask & gt_mask).sum()
-            union = pred_mask.sum() + gt_mask.sum()
+            # Dice
+            intersection = (pred_mask & true_mask).sum()
+            union = pred_mask.sum() + true_mask.sum()
             dice = (2 * intersection + 1e-6) / (union + 1e-6)
             dice_scores.append(dice)
 
         mean_dice = float(np.mean(dice_scores)) if dice_scores else 0.0
         self.trainer.storage.put_scalar("validation/dice_score", mean_dice)
 
-        # Sauvegarde seulement si le Dice s'améliore
+        # Sauvegarde si amélioration
         if mean_dice > self._best_dice:
             print(f"\nValidation Dice amélioré : {self._best_dice:.4f} → {mean_dice:.4f}")
             self._best_dice = mean_dice
@@ -106,6 +112,7 @@ class DiceValidationHook(hooks.HookBase):
             print(f"\nValidation Dice pas amélioré ({mean_dice:.4f} <= {self._best_dice:.4f})")
 
         self.trainer.model.train()
+
 
 
 # ====================
@@ -370,7 +377,7 @@ class UterusSegmentationTrainer:
         print(f"\nEntraînement sur {self.cfg.SOLVER.MAX_ITER} itérations...")
         print(f"   Learning Rate: {self.cfg.SOLVER.BASE_LR}")
         print(f"   Batch Size: {self.cfg.SOLVER.IMS_PER_BATCH}")
-        print(f"   Dice Validation: toutes les 200 iter")
+        print(f"   Dice Validation: toutes les 100 iter")
         print(f"   Output: {self.cfg.OUTPUT_DIR}")
 
         trainer.train()
