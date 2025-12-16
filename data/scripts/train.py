@@ -62,7 +62,8 @@ class DiceValidationHook(hooks.HookBase):
         next_iter = self.trainer.iter + 1
         if next_iter % self.eval_period != 0:
             return
-
+        self.trainer.checkpointer.save("model_for_validation")
+        
         if self.predictor is None:
             self._build_predictor()
 
