@@ -167,11 +167,10 @@ class DiceTrainer(DefaultTrainer):
         # Ajoute notre validation hook
         hooks_list.append(
             DiceValidationHook(
-                eval_period=self.eval_period,
-                val_dataset_name="uterus_val",
-                val_annotations_path=self.val_json,
-                score_thresh=0.5,
-            )
+        eval_period=self.eval_period,
+        val_dataset_name="uterus_val",
+        score_thresh=0.5,
+    )
         )
         # Sauvegarde périodique standard (facultatif)
         hooks_list.append(
