@@ -165,10 +165,14 @@ class DiceTrainer(DefaultTrainer):
     def build_hooks(self):
         hooks_list = super().build_hooks()
         hooks_list.append(
-            DiceValidationHook(
-                eval_period=self.eval_period, val_annotations_path=self.val_json
-            )
-        )
+    DiceValidationHook(
+        eval_period=self.eval_period,
+        val_dataset_name="uterus_val",
+        val_annotations_path=self.val_json,
+        score_thresh=0.5,
+    )
+)
+
         hooks_list.append(
             DiceEarlyStoppingHook(patience=self.patience, min_delta=0.001)
         )
