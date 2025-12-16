@@ -35,6 +35,10 @@ def calculate_dice_score(pred_mask: np.ndarray, gt_mask: np.ndarray) -> float:
 # Validation Hook
 # ====================
 class DiceValidationHook(hooks.HookBase):
+    """
+    Exécute la validation toutes les `eval_period` itérations et sauvegarde
+    le modèle seulement si le Dice s'améliore.
+    """
     def __init__(self, eval_period: int, val_dataset_name: str, val_annotations_path: str, score_thresh: float = 0.5):
         self.eval_period = eval_period
         self.val_dataset_name = val_dataset_name
@@ -55,7 +59,7 @@ class DiceValidationHook(hooks.HookBase):
     def after_step(self):
         next_iter = self.trainer.iter + 1
         if next_iter % self.eval_period != 0:
-            return
+            return  # Sort si ce n'est pas le moment de valider
 
         # Sauvegarde du modèle courant pour validation
         self.trainer.checkpointer.save("model_for_validation")
@@ -67,14 +71,12 @@ class DiceValidationHook(hooks.HookBase):
         dice_scores = []
 
         self.trainer.model.eval()
-
         for data in dataset:
             img = cv2.imread(data["file_name"])
             if img is None:
                 continue
 
             outputs = self.predictor(img)["instances"].to("cpu")
-
             pred_mask = np.zeros(img.shape[:2], dtype=bool)
             if len(outputs) > 0:
                 for m in outputs.pred_masks.numpy():
@@ -84,7 +86,6 @@ class DiceValidationHook(hooks.HookBase):
             img_id = data["image_id"]
             ann_ids = self.coco.getAnnIds(imgIds=img_id)
             anns = self.coco.loadAnns(ann_ids)
-
             for ann in anns:
                 gt_mask |= self.coco.annToMask(ann).astype(bool)
 
@@ -98,11 +99,11 @@ class DiceValidationHook(hooks.HookBase):
 
         # Sauvegarde seulement si le Dice s'améliore
         if mean_dice > self._best_dice:
-            print(f"Validation Dice amélioré : {self._best_dice:.4f} → {mean_dice:.4f}")
+            print(f"\nValidation Dice amélioré : {self._best_dice:.4f} → {mean_dice:.4f}")
             self._best_dice = mean_dice
             self.trainer.checkpointer.save(f"model_best_dice_{mean_dice:.4f}")
         else:
-            print(f"Validation Dice pas amélioré ({mean_dice:.4f} <= {self._best_dice:.4f})")
+            print(f"\nValidation Dice pas amélioré ({mean_dice:.4f} <= {self._best_dice:.4f})")
 
         self.trainer.model.train()
 
@@ -149,29 +150,26 @@ class DiceEarlyStoppingHook(hooks.HookBase):
 # TRAINER AVEC CHECKPOINTS
 # ====================
 class DiceTrainer(DefaultTrainer):
-    def __init__(self, cfg, val_json, eval_period: int = 100, patience: int = 5):
+    def __init__(self, cfg, val_json, eval_period: int = 200):
         self.eval_period = eval_period
-        self.patience = patience
         self.val_json = val_json
         super().__init__(cfg)
 
     def build_hooks(self):
         hooks_list = super().build_hooks()
+        # Ajoute notre validation hook
         hooks_list.append(
-    DiceValidationHook(
-        eval_period=self.eval_period,
-        val_dataset_name="uterus_val",
-        val_annotations_path=self.val_json,
-        score_thresh=0.5,
-    )
-)
-
-        hooks_list.append(
-            DiceEarlyStoppingHook(patience=self.patience)
+            DiceValidationHook(
+                eval_period=self.eval_period,
+                val_dataset_name="uterus_val",
+                val_annotations_path=self.val_json,
+                score_thresh=0.5,
+            )
         )
+        # Sauvegarde périodique standard (facultatif)
         hooks_list.append(
             hooks.PeriodicCheckpointer(
-                checkpointer=self.checkpointer, period=200, max_iter=None
+                checkpointer=self.checkpointer, period=100, max_iter=None
             )
         )
         return hooks_list
@@ -372,7 +370,6 @@ class UterusSegmentationTrainer:
         print(f"   Learning Rate: {self.cfg.SOLVER.BASE_LR}")
         print(f"   Batch Size: {self.cfg.SOLVER.IMS_PER_BATCH}")
         print(f"   Dice Validation: toutes les 200 iter")
-        print(f"   Early Stopping: patience de {trainer.patience} évaluations")
         print(f"   Output: {self.cfg.OUTPUT_DIR}")
 
         trainer.train()
