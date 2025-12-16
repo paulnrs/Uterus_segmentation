@@ -18,6 +18,8 @@ from detectron2.engine import DefaultTrainer, hooks
 from pycocotools.coco import COCO
 
 from evaluate import UterusSegmentationInference
+
+
 # ====================
 # Dice Used for Validation
 # ====================
@@ -28,72 +30,82 @@ def calculate_dice_score(pred_mask: np.ndarray, gt_mask: np.ndarray) -> float:
     union = pred_mask.sum() + gt_mask.sum()
     return (2.0 * intersection) / union if union > 0 else 1.0
 
+
 # ====================
 # Validation Hook
 # ====================
 class DiceValidationHook(hooks.HookBase):
-    def __init__(self, eval_period: int = 200, val_annotations_path: str = "data/val/annotations.json"):
+    def __init__(
+        self,
+        eval_period: int,
+        val_dataset_name: str,
+        val_annotations_path: str,
+        score_thresh: float = 0.5,
+    ):
         self.eval_period = eval_period
-        self.val_annotations_path = val_annotations_path
-        self.coco = COCO(self.val_annotations_path)
+        self.val_dataset_name = val_dataset_name
+        self.coco = COCO(val_annotations_path)
+        self.score_thresh = score_thresh
         self._best_dice = 0.0
-        
+        self.predictor = None
+
+    def _build_predictor(self):
+        from detectron2.engine import DefaultPredictor
+
+        cfg = self.trainer.cfg.clone()
+        cfg.MODEL.WEIGHTS = self.trainer.checkpointer.get_checkpoint_file()
+        cfg.MODEL.ROI_HEADS.SCORE_THRESH_TEST = self.score_thresh
+        cfg.MODEL.DEVICE = self.trainer.cfg.MODEL.DEVICE
+        self.predictor = DefaultPredictor(cfg)
+
     def after_step(self):
         next_iter = self.trainer.iter + 1
         if next_iter % self.eval_period != 0:
             return
-            
-        self.trainer.model.eval()
-        val_dataset_name = self.trainer.cfg.DATASETS.VAL[0]
-        val_dataset = DatasetCatalog.get(val_dataset_name)
+
+        if self.predictor is None:
+            self._build_predictor()
+
+        dataset = DatasetCatalog.get(self.val_dataset_name)
         dice_scores = []
-        
-        print(f"\n{'='*60}")
-        print(f"DICE VALIDATION - Iter {next_iter}")
-        print(f"{'='*60}")
-        
-        for data_dict in val_dataset:             
-            img_path = data_dict["file_name"]
-            image = cv2.imread(img_path)
-            if image is None:
+
+        self.trainer.model.eval()
+
+        for data in dataset:
+            img = cv2.imread(data["file_name"])
+            if img is None:
                 continue
-            image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
-            
-            with torch.no_grad():
-                inputs = {"image": torch.as_tensor(image.transpose(2, 0, 1).astype("float32"))}
-                predictions = self.trainer.model([inputs])[0]
-            
-            pred_mask = np.zeros((image.shape[0], image.shape[1]), dtype=np.uint8)
-            if "instances" in predictions and len(predictions["instances"]) > 0:
-                instances = predictions["instances"].to("cpu")
-                masks = instances.pred_masks.numpy()
-                scores = instances.scores.numpy()
-                for mask, score in zip(masks, scores):
-                    if score > 0.5:
-                        pred_mask = np.logical_or(pred_mask, mask).astype(np.uint8)
-            
-            gt_mask = np.zeros((image.shape[0], image.shape[1]), dtype=np.uint8)
-            img_id = data_dict["image_id"]
+
+            outputs = self.predictor(img)["instances"].to("cpu")
+
+            pred_mask = np.zeros(img.shape[:2], dtype=bool)
+            if len(outputs) > 0:
+                for m in outputs.pred_masks.numpy():
+                    pred_mask |= m
+
+            gt_mask = np.zeros(img.shape[:2], dtype=bool)
+            img_id = data["image_id"]
             ann_ids = self.coco.getAnnIds(imgIds=img_id)
             anns = self.coco.loadAnns(ann_ids)
+
             for ann in anns:
-                gt_mask = np.maximum(gt_mask, self.coco.annToMask(ann))
-            
-            dice = calculate_dice_score(pred_mask, gt_mask)
+                gt_mask |= self.coco.annToMask(ann).astype(bool)
+
+            intersection = (pred_mask & gt_mask).sum()
+            union = pred_mask.sum() + gt_mask.sum()
+            dice = (2 * intersection + 1e-6) / (union + 1e-6)
             dice_scores.append(dice)
-        
-        mean_dice = np.mean(dice_scores) if dice_scores else 0.0
+
+        mean_dice = float(np.mean(dice_scores)) if dice_scores else 0.0
+
         self.trainer.storage.put_scalar("validation/dice_score", mean_dice)
-        
-        print(f"Dice Score: {mean_dice:.4f} (best: {self._best_dice:.4f})")
-        print(f"Images: {len(dice_scores)}")
-        print(f"{'='*60}\n")
-        
+
         if mean_dice > self._best_dice:
             self._best_dice = mean_dice
             self.trainer.checkpointer.save(f"model_best_dice_{mean_dice:.4f}")
-        
+
         self.trainer.model.train()
+
 
 # ====================
 # Early Stopping Hook
@@ -105,7 +117,7 @@ class DiceEarlyStoppingHook(hooks.HookBase):
         self._best_dice = None
         self._best_iter = -1
         self._bad_evals = 0
-        
+
     def after_step(self):
         try:
             history = self.trainer.storage.history("validation/dice_score")
@@ -113,15 +125,15 @@ class DiceEarlyStoppingHook(hooks.HookBase):
             return
         if not history:
             return
-            
-        dice_score = history.latest()[0]
+
+        dice_score = history.latest()
         current_iter = self.trainer.iter
-        
+
         if self._best_dice is None:
             self._best_dice = dice_score
             self._best_iter = current_iter
             return
-        
+
         if dice_score > self._best_dice + self.min_delta:
             print(f" Amélioration: {self._best_dice:.4f} → {dice_score:.4f}")
             self._best_dice = dice_score
@@ -130,7 +142,7 @@ class DiceEarlyStoppingHook(hooks.HookBase):
         else:
             self._bad_evals += 1
             print(f" Pas d'amélioration ({self._bad_evals}/{self.patience})")
-            
+
             if self._bad_evals >= self.patience:
                 print(f"\n{'='*60}")
                 print(f"EARLY STOPPING")
@@ -138,6 +150,7 @@ class DiceEarlyStoppingHook(hooks.HookBase):
                 print(f"{'='*60}\n")
                 self.trainer.checkpointer.save("model_early_stopped")
                 self.trainer._stop_training = True
+
 
 # ====================
 # TRAINER AVEC CHECKPOINTS
@@ -148,23 +161,24 @@ class DiceTrainer(DefaultTrainer):
         self.patience = patience
         self.val_json = val_json
         super().__init__(cfg)
-    
+
     def build_hooks(self):
         hooks_list = super().build_hooks()
-        hooks_list.append(DiceValidationHook(
-            eval_period=self.eval_period,
-            val_annotations_path=self.val_json
-        ))
-        hooks_list.append(DiceEarlyStoppingHook(
-            patience=self.patience,
-            min_delta=0.001
-        ))
-        hooks_list.append(hooks.PeriodicCheckpointer(
-            checkpointer=self.checkpointer,
-            period=200,
-            max_iter=None
-        ))
+        hooks_list.append(
+            DiceValidationHook(
+                eval_period=self.eval_period, val_annotations_path=self.val_json
+            )
+        )
+        hooks_list.append(
+            DiceEarlyStoppingHook(patience=self.patience, min_delta=0.001)
+        )
+        hooks_list.append(
+            hooks.PeriodicCheckpointer(
+                checkpointer=self.checkpointer, period=200, max_iter=None
+            )
+        )
         return hooks_list
+
 
 # ====================
 # DATASET VALIDATOR
@@ -231,7 +245,9 @@ class DatasetValidator:
                     if len(seg) < 6:
                         issues.append(f"Ann {ann_id}: polygone {idx} avec < 3 points")
                     if len(seg) % 2 != 0:
-                        issues.append(f"Ann {ann_id}: polygone {idx} coordonnées impaires")
+                        issues.append(
+                            f"Ann {ann_id}: polygone {idx} coordonnées impaires"
+                        )
             area = ann.get("area", 0)
             if area <= 0:
                 issues.append(f"Ann {ann_id}: aire invalide ({area})")
@@ -243,7 +259,9 @@ class DatasetValidator:
         return issues
 
     def visualize_samples(self, num_samples: int = 4) -> None:
-        img_ids = random.sample(list(self.coco.imgs.keys()), min(num_samples, len(self.coco.imgs)))
+        img_ids = random.sample(
+            list(self.coco.imgs.keys()), min(num_samples, len(self.coco.imgs))
+        )
         fig, axes = plt.subplots(2, 2, figsize=(15, 15))
         axes = axes.ravel()
         for idx, img_id in enumerate(img_ids):
@@ -265,7 +283,12 @@ class DatasetValidator:
             for ann in anns:
                 bbox = ann["bbox"]
                 rect = Rectangle(
-                    (bbox[0], bbox[1]), bbox[2], bbox[3], fill=False, edgecolor="yellow", linewidth=2
+                    (bbox[0], bbox[1]),
+                    bbox[2],
+                    bbox[3],
+                    fill=False,
+                    edgecolor="yellow",
+                    linewidth=2,
                 )
                 axes[idx].add_patch(rect)
             axes[idx].set_title(f"ID: {img_id} - {img_info['file_name'][:30]}")
@@ -273,6 +296,7 @@ class DatasetValidator:
         plt.suptitle("Échantillons du Dataset", fontsize=16)
         plt.tight_layout()
         plt.show()
+
 
 # ====================
 # TRAINER
@@ -283,8 +307,14 @@ class UterusSegmentationTrainer:
         self.setup_config(config_params)
 
     def setup_config(self, params: Optional[dict] = None) -> None:
-        self.cfg.merge_from_file(model_zoo.get_config_file("COCO-InstanceSegmentation/mask_rcnn_R_50_FPN_3x.yaml"))
-        self.cfg.MODEL.WEIGHTS = model_zoo.get_checkpoint_url("COCO-InstanceSegmentation/mask_rcnn_R_50_FPN_3x.yaml")
+        self.cfg.merge_from_file(
+            model_zoo.get_config_file(
+                "COCO-InstanceSegmentation/mask_rcnn_R_50_FPN_3x.yaml"
+            )
+        )
+        self.cfg.MODEL.WEIGHTS = model_zoo.get_checkpoint_url(
+            "COCO-InstanceSegmentation/mask_rcnn_R_50_FPN_3x.yaml"
+        )
         self.cfg.MODEL.ROI_HEADS.NUM_CLASSES = 1
         self.cfg.SOLVER.IMS_PER_BATCH = 16
         self.cfg.SOLVER.BASE_LR = 0.0005
@@ -309,7 +339,9 @@ class UterusSegmentationTrainer:
             for key, value in params.items():
                 setattr(self.cfg, key, value)
 
-    def register_datasets(self, train_json: str, train_imgs: str, val_json: str, val_imgs: str) -> None:
+    def register_datasets(
+        self, train_json: str, train_imgs: str, val_json: str, val_imgs: str
+    ) -> None:
         for name in ("uterus_train", "uterus_val"):
             try:
                 DatasetCatalog.remove(name)
@@ -323,7 +355,7 @@ class UterusSegmentationTrainer:
         register_coco_instances("uterus_val", {}, val_json, val_imgs)
         self.cfg.DATASETS.TRAIN = ("uterus_train",)
         self.cfg.DATASETS.VAL = ("uterus_val",)
-        #self.cfg.DATASETS.TEST = ("uterus_test",)
+        # self.cfg.DATASETS.TEST = ("uterus_test",)
         self.val_json = val_json
         MetadataCatalog.get("uterus_train").set(thing_classes=["uterus"])
         MetadataCatalog.get("uterus_val").set(thing_classes=["uterus"])
@@ -333,12 +365,9 @@ class UterusSegmentationTrainer:
         print("\n" + "=" * 60)
         print("DÉBUT DE L'ENTRAÎNEMENT")
         print("=" * 60)
-        
+
         trainer = DiceTrainer(
-            cfg=self.cfg,
-            val_json=self.val_json,
-            eval_period=200,
-            patience=5
+            cfg=self.cfg, val_json=self.val_json, eval_period=200, patience=5
         )
         trainer.resume_or_load(resume=False)
 
@@ -346,13 +375,14 @@ class UterusSegmentationTrainer:
         print(f"   Learning Rate: {self.cfg.SOLVER.BASE_LR}")
         print(f"   Batch Size: {self.cfg.SOLVER.IMS_PER_BATCH}")
         print(f"   Dice Validation: toutes les 200 iter")
-        print(f"   Early Stopping: patience de 5 évaluations")
+        print(f"   Early Stopping: patience de {trainer.patience} évaluations")
         print(f"   Output: {self.cfg.OUTPUT_DIR}")
 
         trainer.train()
         trainer.checkpointer.save("model_final")
         print("\nEntraînement terminé !")
         return trainer
+
 
 # ====================
 # PIPELINE PRINCIPALE
@@ -370,7 +400,9 @@ def main_training_pipeline() -> Tuple[UterusSegmentationTrainer, dict]:
     print("\nÉTAPE 2: Configuration du modèle")
     trainer = UterusSegmentationTrainer()
     print("   Utilisation des données fournies")
-    trainer.register_datasets(TRAIN_ANNOTATIONS, TRAIN_IMAGES, VAL_ANNOTATIONS, VAL_IMAGES)
+    trainer.register_datasets(
+        TRAIN_ANNOTATIONS, TRAIN_IMAGES, VAL_ANNOTATIONS, VAL_IMAGES
+    )
     print("Warmup iters:", trainer.cfg.SOLVER.WARMUP_ITERS)
     print("Warmup factor:", trainer.cfg.SOLVER.WARMUP_FACTOR)
     print("\nÉTAPE 3: Entraînement du modèle")
@@ -385,6 +417,7 @@ def main_training_pipeline() -> Tuple[UterusSegmentationTrainer, dict]:
     print(f"\nModèle sauvegardé dans: {trainer.cfg.OUTPUT_DIR}")
     print("Configuration sauvegardée: output/config.yaml")
     return trainer_instance, {}
+
 
 if __name__ == "__main__":
     trainer, results = main_training_pipeline()
@@ -401,5 +434,3 @@ if __name__ == "__main__":
             print(f"Score max: {test_result['scores'].max():.3f}")
     else:
         print("Aucune image 'sample.jpg' trouvée dans data/test/images")
-
-
