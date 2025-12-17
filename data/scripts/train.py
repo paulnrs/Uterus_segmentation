@@ -32,6 +32,7 @@ class DiceValidationHook(hooks.HookBase):
         self.best_dice = 0.0
 
     def after_step(self):
+        # On ne valide qu'à l'itération souhaitée
         next_iter = self.trainer.iter + 1
         if next_iter % self.eval_period != 0:
             return
@@ -39,51 +40,53 @@ class DiceValidationHook(hooks.HookBase):
         print(f"\n{'='*60}")
         print(f"Validation Dice @ iter {next_iter}")
 
-        model = self.trainer.model
-        model.eval()
+        # Préparer le predictor avec les poids courants
+        cfg = self.trainer.cfg.clone()
+        cfg.MODEL.WEIGHTS = self.trainer.checkpointer.get_checkpoint_file()
+        cfg.MODEL.ROI_HEADS.SCORE_THRESH_TEST = 0.01  # pour maximiser les TP
+        predictor = DefaultPredictor(cfg)
 
-        mapper = DatasetMapper(self.trainer.cfg, is_train=False)
-        data_loader = build_detection_test_loader(
-            self.trainer.cfg,
-            self.val_dataset_name,
-            mapper=mapper
-        )
-
+        # Récupérer les données du dataset de validation
+        dataset_dicts = DatasetCatalog.get(self.val_dataset_name)
         dice_scores = []
 
-        with torch.no_grad():
-            for batch in data_loader:
-                outputs = model(batch)
-                for inp, out in zip(batch, outputs):
-                    img = inp["image"].permute(1, 2, 0).cpu().numpy()
+        for data in dataset_dicts:
+            img_path = data["file_name"]
+            if not os.path.isabs(img_path):
+                img_path = os.path.join(self.image_root, os.path.basename(img_path))
 
-                    # prédiction
-                    instances = out["instances"].to("cpu")
-                    pred_mask = np.zeros(img.shape[:2], dtype=bool)
-                    if len(instances) > 0:
-                        best = instances.scores.argmax()
-                        pred_mask = instances.pred_masks[best].numpy()
+            img = cv2.imread(img_path)
+            if img is None:
+                continue
 
-                    # GT
-                    true_mask = np.zeros(img.shape[:2], dtype=bool)
-                    for ann in inp["annotations"]:  # ou inp["instances"] si train loader
-                        segm = ann["segmentation"]
-                        if isinstance(segm, dict):  # RLE
-                            m = mask_util.decode(segm)
-                        else:  # Polygon
-                            m = np.zeros(img.shape[:2], dtype=np.uint8)
-                            for poly in segm:
-                                poly_np = np.array(poly).reshape(-1, 2)
-                                cv2.fillPoly(m, [poly_np.astype(np.int32)], 1)
-                        true_mask |= m.astype(bool)
+            outputs = predictor(img)["instances"].to("cpu")
 
+            # --- masque prédictif (un seul masque le plus confiant)
+            pred_mask = np.zeros(img.shape[:2], dtype=bool)
+            if len(outputs) > 0:
+                best_idx = outputs.scores.argmax()
+                pred_mask = outputs.pred_masks[best_idx].numpy()
 
-                    intersection = (pred_mask & true_mask).sum()
-                    union = pred_mask.sum() + true_mask.sum()
-                    dice = (2 * intersection + 1e-6) / (union + 1e-6)
-                    dice_scores.append(dice)
+            # --- masque GT à partir des annotations COCO
+            true_mask = np.zeros(img.shape[:2], dtype=bool)
+            for ann in data["annotations"]:
+                segm = ann["segmentation"]
+                if isinstance(segm, dict):  # RLE
+                    m = mask_util.decode(segm)
+                else:  # Polygon
+                    m = np.zeros(img.shape[:2], dtype=np.uint8)
+                    for poly in segm:
+                        poly_np = np.array(poly).reshape(-1, 2)
+                        cv2.fillPoly(m, [poly_np.astype(np.int32)], 1)
+                true_mask |= m.astype(bool)
 
-        mean_dice = float(np.mean(dice_scores))
+            # --- Dice
+            intersection = (pred_mask & true_mask).sum()
+            union = pred_mask.sum() + true_mask.sum()
+            dice = (2 * intersection + 1e-6) / (union + 1e-6)
+            dice_scores.append(dice)
+
+        mean_dice = float(np.mean(dice_scores)) if dice_scores else 0.0
         self.trainer.storage.put_scalar("validation/dice", mean_dice)
 
         print(f"Dice moyen: {mean_dice:.4f}")
