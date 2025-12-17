@@ -128,16 +128,20 @@ class UterusSegmentationTrainer:
             "COCO-InstanceSegmentation/mask_rcnn_R_50_FPN_3x.yaml"
         )
 
-        self.cfg.MODEL.ROI_HEADS.NUM_CLASSES = 1
+        self.cfg.SOLVER.BASE_LR = 3e-4
+        self.cfg.SOLVER.MAX_ITER = 2000
         self.cfg.SOLVER.IMS_PER_BATCH = 16
-        self.cfg.SOLVER.BASE_LR = 5e-4
-        self.cfg.SOLVER.MAX_ITER = 1400
-        self.cfg.MODEL.ROI_HEADS.SCORE_THRESH_TEST = 0.01
-        self.cfg.MODEL.ROI_HEADS.NMS_THRESH_TEST = 0.8
+
+        self.cfg.MODEL.ROI_HEADS.BATCH_SIZE_PER_IMAGE = 512
+        self.cfg.MODEL.ROI_HEADS.POSITIVE_FRACTION = 0.5
+
+        self.cfg.MODEL.RPN.PRE_NMS_TOPK_TRAIN = 3000
+        self.cfg.MODEL.RPN.POST_NMS_TOPK_TRAIN = 2000
+        self.cfg.MODEL.RPN.PRE_NMS_TOPK_TEST = 3000
         self.cfg.MODEL.RPN.POST_NMS_TOPK_TEST = 2000
-        self.cfg.MODEL.RPN.PRE_NMS_TOPK_TEST = 4000
-        self.cfg.INPUT.FORMAT = "BGR"
-        self.cfg.OUTPUT_DIR = "./output"
+
+        self.cfg.MODEL.ROI_HEADS.SCORE_THRESH_TEST = 0.03
+        self.cfg.MODEL.ROI_HEADS.NMS_THRESH_TEST = 0.5
         Path(self.cfg.OUTPUT_DIR).mkdir(exist_ok=True)
 
         self.cfg.MODEL.DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
