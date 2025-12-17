@@ -10,10 +10,9 @@ from detectron2.engine import hooks
 from detectron2.utils.events import get_event_storage
 from detectron2 import model_zoo
 from detectron2.config import get_cfg
-from detectron2.data import DatasetCatalog, MetadataCatalog, build_detection_test_loader, DatasetMapper
+from detectron2.data import DatasetCatalog, MetadataCatalog
 from detectron2.data.datasets import register_coco_instances
-from detectron2.engine import DefaultTrainer, hooks
-from detectron2.evaluation import DatasetEvaluator, inference_on_dataset
+from detectron2.engine import DefaultTrainer
 from detectron2.utils.comm import is_main_process
 
 from pycocotools.coco import COCO
@@ -79,50 +78,56 @@ class EarlyStoppingHook(hooks.HookBase):
             
             # ✅ Arrêter l'entraînement
             raise StopIteration("Early stopping triggered")
-        
-class DiceEvaluator(DatasetEvaluator):
+
+
+class DiceEvaluator:
+    """Évaluateur de Dice simplifié qui travaille directement avec les données"""
+    
+    def __init__(self):
+        self.reset()
+    
     def reset(self):
         self.dices = []
         self.total_preds = 0
         self.total_gts = 0
 
-    def process(self, inputs, outputs):
-        for inp, out in zip(inputs, outputs):
-            h, w = inp["height"], inp["width"]
+    def process_one(self, data_dict, prediction):
+        """Process une seule image"""
+        h, w = data_dict["height"], data_dict["width"]
 
-            # Construction du masque de prédiction
-            if len(out["instances"]) == 0:
-                pred_mask = np.zeros((h, w), dtype=bool)
-            else:
-                pred_masks = out["instances"].pred_masks.cpu().numpy()
-                pred_mask = pred_masks.any(axis=0)
+        # Construction du masque de prédiction
+        if len(prediction["instances"]) == 0:
+            pred_mask = np.zeros((h, w), dtype=bool)
+        else:
+            pred_masks = prediction["instances"].pred_masks.cpu().numpy()
+            pred_mask = pred_masks.any(axis=0)
 
-            # Construction du masque GT
-            gt_mask = np.zeros((h, w), dtype=np.uint8)
+        # Construction du masque GT
+        gt_mask = np.zeros((h, w), dtype=np.uint8)
 
-            for ann in inp.get("annotations", []):
-                seg = ann.get("segmentation", [])
-                
-                if isinstance(seg, dict):  # RLE
-                    m = mask_util.decode(seg)
-                    gt_mask = np.maximum(gt_mask, m.astype(np.uint8))
-                
-                elif isinstance(seg, list):  # Polygones
-                    for poly in seg:
-                        poly_np = np.array(poly).reshape(-1, 2).astype(np.int32)
-                        cv2.fillPoly(gt_mask, [poly_np], 1)
-
-            gt_mask = gt_mask.astype(bool)
+        for ann in data_dict.get("annotations", []):
+            seg = ann.get("segmentation", [])
             
-            # Compteurs
-            self.total_preds += pred_mask.sum()
-            self.total_gts += gt_mask.sum()
+            if isinstance(seg, dict):  # RLE
+                m = mask_util.decode(seg)
+                gt_mask = np.maximum(gt_mask, m.astype(np.uint8))
             
-            # Calcul du Dice
-            inter = np.logical_and(pred_mask, gt_mask).sum()
-            union = pred_mask.sum() + gt_mask.sum()
-            dice = (2 * inter / union) if union > 0 else 0.0
-            self.dices.append(dice)
+            elif isinstance(seg, list):  # Polygones
+                for poly in seg:
+                    poly_np = np.array(poly).reshape(-1, 2).astype(np.int32)
+                    cv2.fillPoly(gt_mask, [poly_np], 1)
+
+        gt_mask = gt_mask.astype(bool)
+        
+        # Compteurs
+        self.total_preds += pred_mask.sum()
+        self.total_gts += gt_mask.sum()
+        
+        # Calcul du Dice
+        inter = np.logical_and(pred_mask, gt_mask).sum()
+        union = pred_mask.sum() + gt_mask.sum()
+        dice = (2 * inter / union) if union > 0 else 0.0
+        self.dices.append(dice)
 
     def evaluate(self):
         if not self.dices:
@@ -147,13 +152,44 @@ class DiceEvaluator(DatasetEvaluator):
 
 
 def dice_eval_fn(cfg, model):
+    """
+    Fonction d'évaluation qui charge les données avec annotations
+    et fait l'inférence manuellement (comme le script offline)
+    """
     evaluator = DiceEvaluator()
-    # ✅ Forcer le chargement des annotations
-    from detectron2.data import DatasetMapper
-    mapper = DatasetMapper(cfg, is_train=False, augmentations=[])
-    loader = build_detection_test_loader(cfg, cfg.DATASETS.TEST[0], mapper=mapper)
-    results = inference_on_dataset(model, loader, evaluator)
-    return results
+    
+    # Charger les données brutes avec annotations
+    dataset_dicts = DatasetCatalog.get(cfg.DATASETS.TEST[0])
+    
+    model.eval()
+    with torch.no_grad():
+        for data in dataset_dicts:
+            # Charger l'image
+            img = cv2.imread(data["file_name"])
+            if img is None:
+                print(f"⚠️ Cannot read image: {data['file_name']}")
+                continue
+                
+            height, width = img.shape[:2]
+            
+            # Préparer l'input pour le modèle
+            image_tensor = torch.as_tensor(img.transpose(2, 0, 1).astype("float32"))
+            if torch.cuda.is_available():
+                image_tensor = image_tensor.cuda()
+            
+            inputs = [{
+                "image": image_tensor,
+                "height": height,
+                "width": width
+            }]
+            
+            # Prédire
+            outputs = model(inputs)
+            
+            # Évaluer avec les annotations originales
+            evaluator.process_one(data, outputs[0])
+    
+    return evaluator.evaluate()
 
 
 class DiceTrainer(DefaultTrainer):
@@ -174,7 +210,7 @@ class DiceTrainer(DefaultTrainer):
         )
         
         early_stop = EarlyStoppingHook(
-            patience=10,  # ✅ Augmenté à 10
+            patience=10,
             metric_name="dice",
             mode="max"
         )
@@ -184,7 +220,6 @@ class DiceTrainer(DefaultTrainer):
         hooks_list.insert(-1, early_stop)  
 
         return hooks_list
-
 
 
 class DatasetValidator:
