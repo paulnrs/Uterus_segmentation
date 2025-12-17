@@ -44,7 +44,11 @@ class DiceValidationHook(hooks.HookBase):
         dice_scores = []
 
         for data in dataset_dicts:
-            img_path = os.path.join(self.image_root, data["file_name"])
+    # Si le JSON est standard, juste concaténer file_name
+            if os.path.isabs(data["file_name"]) or "data/val/images" in data["file_name"]:
+                img_path = data["file_name"]
+            else:
+                img_path = os.path.join(self.image_root, data["file_name"])
             img = cv2.imread(img_path)
             if img is None:
                 print(f"⚠️ Image introuvable, ignorée : {data['file_name']}")
