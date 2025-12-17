@@ -1,194 +1,23 @@
-"""Training pipeline for Detectron2 uterus segmentation - Version Optimisée."""
+"""Training pipeline for Detectron2 uterus segmentation - Version Minimale."""
 
 from __future__ import annotations
 from pathlib import Path
 from typing import Tuple
 
-import cv2
-import numpy as np
 import torch
 
 from detectron2 import model_zoo
 from detectron2.config import get_cfg
 from detectron2.data import DatasetCatalog, MetadataCatalog
 from detectron2.data.datasets import register_coco_instances
-from detectron2.engine import DefaultTrainer, hooks
+from detectron2.engine import DefaultTrainer
 from detectron2.utils.comm import is_main_process
-from detectron2.utils.events import get_event_storage
 
 from pycocotools.coco import COCO
-from pycocotools import mask as mask_util
 
 
 # ====================
-# EARLY STOPPING
-# ====================
-class EarlyStoppingHook(hooks.HookBase):
-    """Early stopping basé sur le Dice score de validation."""
-    
-    def __init__(self, patience: int = 10, metric_name: str = "dice"):
-        self.patience = patience
-        self.metric_name = metric_name
-        self.best_metric = None
-        self.counter = 0
-
-    def after_step(self):
-        storage = get_event_storage()
-        
-        if self.metric_name not in storage._latest_scalars:
-            return
-        
-        current_metric = storage._latest_scalars[self.metric_name][0]
-        
-        if self.best_metric is None:
-            self.best_metric = current_metric
-            self.counter = 0
-            print(f"📊 Early stopping initialisé: {self.metric_name} = {current_metric:.4f}")
-            return
-        
-        if current_metric > self.best_metric:
-            improvement = current_metric - self.best_metric
-            self.best_metric = current_metric
-            self.counter = 0
-            print(f"✅ Amélioration: {self.metric_name} = {current_metric:.4f} (+{improvement:.4f})")
-        else:
-            self.counter += 1
-            print(f"⏸️  Pas d'amélioration ({self.counter}/{self.patience}): "
-                  f"{self.metric_name} = {current_metric:.4f} (best: {self.best_metric:.4f})")
-        
-        if self.counter >= self.patience:
-            print(f"\n🛑 EARLY STOPPING à iter {self.trainer.iter}")
-            print(f"   Meilleur {self.metric_name}: {self.best_metric:.4f}\n")
-            raise StopIteration("Early stopping triggered")
-
-
-# ====================
-# DICE EVALUATOR
-# ====================
-class SimpleDiceEvaluator:
-    """Évaluateur Dice - même logique que votre script offline."""
-    
-    def __init__(self):
-        self.reset()
-    
-    def reset(self):
-        self.dices = []
-
-    def process_one(self, data_dict, prediction):
-        """Traite une image - identique à votre code offline."""
-        h, w = data_dict["height"], data_dict["width"]
-
-        # Masque de prédiction
-        if len(prediction["instances"]) == 0:
-            pred_mask = np.zeros((h, w), dtype=bool)
-        else:
-            pred_masks = prediction["instances"].pred_masks.cpu().numpy()
-            pred_mask = pred_masks.any(axis=0)
-
-        # Masque GT - EXACTEMENT comme votre script offline
-        gt_mask = np.zeros((h, w), dtype=np.uint8)
-        
-        for ann in data_dict.get("annotations", []):
-            seg = ann.get("segmentation", [])
-            
-            if isinstance(seg, dict):  # RLE
-                m = mask_util.decode(seg)
-                gt_mask = np.maximum(gt_mask, m.astype(np.uint8))
-            
-            elif isinstance(seg, list):  # Polygones
-                for poly in seg:
-                    poly_np = np.array(poly).reshape(-1, 2).astype(np.int32)
-                    cv2.fillPoly(gt_mask, [poly_np], 1)
-
-        gt_mask = gt_mask.astype(bool)
-        
-        # Dice
-        inter = np.logical_and(pred_mask, gt_mask).sum()
-        union = pred_mask.sum() + gt_mask.sum()
-        dice = (2 * inter / union) if union > 0 else 0.0
-        self.dices.append(dice)
-
-    def evaluate(self):
-        if not self.dices:
-            return {"dice": 0.0}
-
-        mean_dice = float(np.mean(self.dices))
-
-        if is_main_process():
-            print(f"\n{'='*60}")
-            print(f"DICE EVALUATION")
-            print(f"{'='*60}")
-            print(f"Mean Dice: {mean_dice:.4f}")
-            print(f"Min Dice : {np.min(self.dices):.4f}")
-            print(f"Max Dice : {np.max(self.dices):.4f}")
-            print(f"Std Dice : {np.std(self.dices):.4f}")
-            print(f"N images : {len(self.dices)}")
-            print(f"{'='*60}\n")
-
-        return {"dice": mean_dice}
-
-
-def dice_eval_fn(cfg, model):
-    """Évaluation Dice - charge les données comme votre script offline."""
-    evaluator = SimpleDiceEvaluator()
-    dataset_dicts = DatasetCatalog.get(cfg.DATASETS.TEST[0])
-    
-    model.eval()
-    with torch.no_grad():
-        for data in dataset_dicts:
-            img = cv2.imread(data["file_name"])
-            if img is None:
-                continue
-                
-            height, width = img.shape[:2]
-            image_tensor = torch.as_tensor(img.transpose(2, 0, 1).astype("float32"))
-            if torch.cuda.is_available():
-                image_tensor = image_tensor.cuda()
-            
-            inputs = [{"image": image_tensor, "height": height, "width": width}]
-            outputs = model(inputs)
-            evaluator.process_one(data, outputs[0])
-    
-    model.train()
-    return evaluator.evaluate()
-
-
-# ====================
-# TRAINER
-# ====================
-class DiceTrainer(DefaultTrainer):
-    """Trainer avec évaluation Dice et early stopping."""
-    
-    def build_hooks(self):
-        hooks_list = super().build_hooks()
-
-        # Évaluation Dice toutes les 250 itérations
-        eval_hook = hooks.EvalHook(
-            eval_period=250,
-            eval_function=lambda: dice_eval_fn(self.cfg, self.model),
-        )
-
-        # Sauvegarde du meilleur modèle
-        best_checkpointer = hooks.BestCheckpointer(
-            eval_period=250,
-            checkpointer=self.checkpointer,
-            val_metric="dice",
-            mode="max",
-            file_prefix="model_best",
-        )
-        
-        # Early stopping
-        early_stop = EarlyStoppingHook(patience=10, metric_name="dice")
-
-        hooks_list.insert(-1, eval_hook)
-        hooks_list.insert(-1, best_checkpointer)
-        hooks_list.insert(-1, early_stop)
-
-        return hooks_list
-
-
-# ====================
-# VALIDATOR
+# VALIDATOR (minimal)
 # ====================
 class DatasetValidator:
     """Validation simple du dataset."""
@@ -212,7 +41,7 @@ class DatasetValidator:
 # CONFIGURATION
 # ====================
 class UterusSegmentationTrainer:
-    """Configuration et entraînement optimisés pour maximiser les vrais positifs."""
+    """Configuration optimisée pour maximiser les vrais positifs."""
     
     def __init__(self):
         self.cfg = get_cfg()
@@ -236,22 +65,21 @@ class UterusSegmentationTrainer:
         self.cfg.SOLVER.STEPS = (4000, 5500)
         self.cfg.SOLVER.GAMMA = 0.1
         self.cfg.SOLVER.CHECKPOINT_PERIOD = 500
+        
+        # Accélération DataLoader
+        self.cfg.DATALOADER.NUM_WORKERS = 2
 
         # ✅ OPTIMISATION POUR MAXIMISER LES VRAIS POSITIFS
-        # Augmenter le nombre de propositions pour ne rien manquer
-        self.cfg.MODEL.RPN.PRE_NMS_TOPK_TRAIN = 3000  # ↑ Plus de propositions
-        self.cfg.MODEL.RPN.POST_NMS_TOPK_TRAIN = 2000  # ↑
+        self.cfg.MODEL.RPN.PRE_NMS_TOPK_TRAIN = 3000
+        self.cfg.MODEL.RPN.POST_NMS_TOPK_TRAIN = 2000
         self.cfg.MODEL.RPN.PRE_NMS_TOPK_TEST = 3000
         self.cfg.MODEL.RPN.POST_NMS_TOPK_TEST = 2000
         
-        # Seuils très permissifs pour capturer toutes les détections
-        self.cfg.MODEL.ROI_HEADS.SCORE_THRESH_TEST = 0.01  # ↓ Seuil très bas
-        self.cfg.MODEL.ROI_HEADS.NMS_THRESH_TEST = 0.7  # ↑ Permet plus de chevauchement
-        
-        # Plus de ROIs par image pour ne rien manquer
+        self.cfg.MODEL.ROI_HEADS.SCORE_THRESH_TEST = 0.01
+        self.cfg.MODEL.ROI_HEADS.NMS_THRESH_TEST = 0.7
         self.cfg.MODEL.ROI_HEADS.BATCH_SIZE_PER_IMAGE = 512
 
-        # Augmentation de données pour robustesse
+        # Augmentation de données
         self.cfg.INPUT.MIN_SIZE_TRAIN = (640, 672, 704, 736, 768, 800)
         self.cfg.INPUT.MAX_SIZE_TRAIN = 1333
         self.cfg.INPUT.RANDOM_FLIP = "horizontal"
@@ -279,7 +107,7 @@ class UterusSegmentationTrainer:
 
     def train(self):
         """Lance l'entraînement."""
-        trainer = DiceTrainer(self.cfg)
+        trainer = DefaultTrainer(self.cfg)
         trainer.resume_or_load(resume=False)
         trainer.train()
         
@@ -329,10 +157,8 @@ def main_training_pipeline() -> Tuple[DefaultTrainer, dict]:
     print("\n" + "="*60)
     print("✅ ENTRAÎNEMENT TERMINÉ")
     print("="*60)
-    print(f"\n📁 Modèles sauvegardés dans: {trainer_obj.cfg.OUTPUT_DIR}/")
-    print("   • model_best.pth   (meilleur Dice)")
-    print("   • model_final.pth  (dernier checkpoint)")
-    print("   • config.yaml      (configuration)")
+    print(f"\n📁 Modèle sauvegardé: {trainer_obj.cfg.OUTPUT_DIR}/model_final.pth")
+    print(f"📁 Config sauvegardée: output/config.yaml")
 
     return trainer, {}
 
