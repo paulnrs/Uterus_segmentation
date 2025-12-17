@@ -24,28 +24,13 @@ from pycocotools.coco import COCO
 # ======================================================
 # VALIDATION DICE HOOK (ALIGNÉ OFFLINE)
 # ======================================================
-class DiceValidationHookOfflineStyle(hooks.HookBase):
-    """
-    Validation en ligne qui suit exactement la logique offline :
-    - lit les images depuis image_root
-    - construit les masques
-    - calcule Dice image par image
-    """
-    def __init__(self, eval_period, val_dataset_name, image_root, predictor_instance, score_thresh=0.5):
+class DiceValidationHook(hooks.HookBase):
+    def __init__(self, eval_period, val_dataset_name, image_root, predictor_instance):
         self.eval_period = eval_period
         self.val_dataset_name = val_dataset_name
         self.image_root = image_root
-        self.predictor = predictor_instance
-        self.score_thresh = score_thresh
+        self.predictor_instance = predictor_instance
         self._best_dice = 0.0
-
-    @staticmethod
-    def compute_dice(pred_mask: np.ndarray, true_mask: np.ndarray, smooth=1e-6):
-        pred_mask = pred_mask.astype(bool)
-        true_mask = true_mask.astype(bool)
-        intersection = (pred_mask & true_mask).sum()
-        union = pred_mask.sum() + true_mask.sum()
-        return (2 * intersection + smooth) / (union + smooth)
 
     def after_step(self):
         next_iter = self.trainer.iter + 1
@@ -58,26 +43,20 @@ class DiceValidationHookOfflineStyle(hooks.HookBase):
         dataset_dicts = DatasetCatalog.get(self.val_dataset_name)
         dice_scores = []
 
-        for data in tqdm(dataset_dicts, desc="Validation online"):
+        for data in dataset_dicts:
             img_path = os.path.join(self.image_root, data["file_name"])
             img = cv2.imread(img_path)
-
             if img is None:
                 print(f"⚠️ Image introuvable, ignorée : {data['file_name']}")
                 continue
 
-            # --- prédiction avec le predictor (comme offline) ---
-            outputs = self.predictor(img)["instances"].to("cpu")
+            outputs = self.predictor_instance(img)["instances"].to("cpu")
 
-            # --- masque de prédiction ---
             pred_mask = np.zeros(img.shape[:2], dtype=bool)
             if len(outputs) > 0:
-                high_conf = outputs.scores > self.score_thresh
-                if high_conf.any():
-                    for m in outputs.pred_masks[high_conf].numpy():
-                        pred_mask |= m
+                for m in outputs.pred_masks.numpy():
+                    pred_mask |= m
 
-            # --- masque vérité terrain ---
             true_mask = np.zeros(img.shape[:2], dtype=bool)
             for ann in data["annotations"]:
                 segm = ann["segmentation"]
@@ -86,12 +65,13 @@ class DiceValidationHookOfflineStyle(hooks.HookBase):
                 else:
                     m = np.zeros(img.shape[:2], dtype=np.uint8)
                     for poly in segm:
-                        poly_np = np.array(poly).reshape(-1,2)
+                        poly_np = np.array(poly).reshape(-1, 2)
                         cv2.fillPoly(m, [poly_np.astype(np.int32)], 1)
                 true_mask |= m.astype(bool)
 
-            # --- calcul du Dice ---
-            dice = self.compute_dice(pred_mask, true_mask)
+            intersection = (pred_mask & true_mask).sum()
+            union = pred_mask.sum() + true_mask.sum()
+            dice = (2 * intersection) / union if union > 0 else 1.0
             dice_scores.append(dice)
 
         mean_dice = float(np.mean(dice_scores)) if dice_scores else 0.0
@@ -111,6 +91,7 @@ class DiceValidationHookOfflineStyle(hooks.HookBase):
 
 
 
+
 # ======================================================
 # TRAINER PERSONNALISÉ
 # ======================================================
@@ -123,15 +104,16 @@ class DiceTrainer(DefaultTrainer):
 
     def build_hooks(self):
         hooks_list = super().build_hooks()
+
         hooks_list.append(
-            DiceValidationHookOfflineStyle(
+            DiceValidationHook(
                 eval_period=self.eval_period,
                 val_dataset_name="uterus_val",
                 image_root=self.val_image_root,
                 predictor_instance=self.predictor_instance,
-                score_thresh=0.5,
             )
         )
+
         return hooks_list
 
 
@@ -181,7 +163,7 @@ class UterusSegmentationTrainer:
 
         self.cfg.MODEL.DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
-    def register_datasets(self, train_json, train_imgs, val_json, val_imgs=""):
+    def register_datasets(self, train_json, train_imgs, val_json, val_imgs):
         for name in ("uterus_train", "uterus_val"):
             try:
                 DatasetCatalog.remove(name)
@@ -195,16 +177,18 @@ class UterusSegmentationTrainer:
         self.cfg.DATASETS.TRAIN = ("uterus_train",)
         self.cfg.DATASETS.TEST = ()
 
-        self.val_image_root = val_imgs
+        self.val_image_root = val_imgs  # <-- chemin validé pour le hook
 
         MetadataCatalog.get("uterus_train").set(thing_classes=["uterus"])
         MetadataCatalog.get("uterus_val").set(thing_classes=["uterus"])
 
     def train(self):
+        predictor = DefaultPredictor(self.cfg)
         trainer = DiceTrainer(
             self.cfg,
-            val_image_root=self.val_image_root,
-            eval_period=200,
+            val_image_root=self.val_image_root,  # <-- chemin correct
+            predictor_instance=predictor,        # <-- on passe le predictor
+            eval_period=200
         )
         trainer.resume_or_load(resume=False)
         trainer.train()
@@ -219,13 +203,13 @@ def main_training_pipeline() -> Tuple[DefaultTrainer, dict]:
     TRAIN_JSON = "data/train/annotations.json"
     TRAIN_IMAGES = "data/train/images"
     VAL_JSON = "data/val/annotations.json"
-    #VAL_IMAGES = "data/val/images"
+    VAL_IMAGES = "data/val/images"  # <-- décommenté et utilisé
 
     DatasetValidator(TRAIN_JSON, TRAIN_IMAGES).validate_dataset()
 
     trainer = UterusSegmentationTrainer()
     trainer.register_datasets(
-        TRAIN_JSON, TRAIN_IMAGES, VAL_JSON
+        TRAIN_JSON, TRAIN_IMAGES, VAL_JSON, VAL_IMAGES
     )
 
     trainer_instance = trainer.train()
