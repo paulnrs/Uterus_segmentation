@@ -1,9 +1,10 @@
 from __future__ import annotations
 from pathlib import Path
 from typing import Tuple
-import cv2 
+
 import numpy as np
 import torch
+import cv2
 
 from detectron2.engine import hooks
 from detectron2.utils.events import get_event_storage
@@ -87,22 +88,35 @@ class DiceEvaluator(DatasetEvaluator):
         for inp, out in zip(inputs, outputs):
             h, w = inp["height"], inp["width"]
 
-            # ✅ DEBUG : Vérifier les prédictions
-            num_preds = len(out["instances"])
-            if num_preds > 0:
-                scores = out["instances"].scores.cpu().numpy()
-                print(f"  → {num_preds} prédictions (scores: {scores.min():.3f} - {scores.max():.3f})")
-            
+            # Construction du masque de prédiction
             if len(out["instances"]) == 0:
                 pred_mask = np.zeros((h, w), dtype=bool)
             else:
                 pred_masks = out["instances"].pred_masks.cpu().numpy()
                 pred_mask = pred_masks.any(axis=0)
 
-            # ... reste du code GT mask ...
+            # Construction du masque GT
+            gt_mask = np.zeros((h, w), dtype=np.uint8)
+
+            for ann in inp.get("annotations", []):
+                seg = ann.get("segmentation", [])
+                
+                if isinstance(seg, dict):  # RLE
+                    m = mask_util.decode(seg)
+                    gt_mask = np.maximum(gt_mask, m.astype(np.uint8))
+                
+                elif isinstance(seg, list):  # Polygones
+                    for poly in seg:
+                        poly_np = np.array(poly).reshape(-1, 2).astype(np.int32)
+                        cv2.fillPoly(gt_mask, [poly_np], 1)
+
+            gt_mask = gt_mask.astype(bool)
             
-            # ✅ DEBUG : Vérifier les masques
-            print(f"  → Pred pixels: {pred_mask.sum()}, GT pixels: {gt_mask.sum()}")
+            # Calcul du Dice
+            inter = np.logical_and(pred_mask, gt_mask).sum()
+            union = pred_mask.sum() + gt_mask.sum()
+            dice = (2 * inter / union) if union > 0 else 0.0
+            self.dices.append(dice)
 
     def evaluate(self):
         if not self.dices:
@@ -150,7 +164,7 @@ class DiceTrainer(DefaultTrainer):
         )
         
         early_stop = EarlyStoppingHook(
-            patience=10,
+            patience=10,  # ✅ Augmenté à 10
             metric_name="dice",
             mode="max"
         )
