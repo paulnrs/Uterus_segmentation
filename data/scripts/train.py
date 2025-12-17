@@ -127,7 +127,7 @@ class UterusSegmentationTrainer:
         self.cfg.MODEL.WEIGHTS = model_zoo.get_checkpoint_url(
             "COCO-InstanceSegmentation/mask_rcnn_R_50_FPN_3x.yaml"
         )
-
+        self.cfg.SOLVER.CHECKPOINT_PERIOD = 400
         self.cfg.SOLVER.BASE_LR = 3e-4
         self.cfg.SOLVER.MAX_ITER = 2000
         self.cfg.SOLVER.IMS_PER_BATCH = 16
