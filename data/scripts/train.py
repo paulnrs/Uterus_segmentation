@@ -25,12 +25,11 @@ from pycocotools.coco import COCO
 # VALIDATION DICE HOOK (ALIGNÉ OFFLINE)
 # ======================================================
 class DiceValidationHook(hooks.HookBase):
-    def __init__(self, eval_period, val_dataset_name, image_root, predictor_instance):
+    def __init__(self, eval_period, val_dataset_name, image_root):
         self.eval_period = eval_period
         self.val_dataset_name = val_dataset_name
         self.image_root = image_root
-        self.predictor_instance = predictor_instance
-        self._best_dice = 0.0
+        self.best_dice = 0.0
 
     def after_step(self):
         next_iter = self.trainer.iter + 1
@@ -40,37 +39,34 @@ class DiceValidationHook(hooks.HookBase):
         print(f"\n{'='*60}")
         print(f"Validation Dice @ iter {next_iter}")
 
+        #IMPORTANT : recharger les poids courants
+        cfg = self.trainer.cfg.clone()
+        cfg.MODEL.WEIGHTS = self.trainer.checkpointer.get_checkpoint_file()
+        cfg.MODEL.ROI_HEADS.SCORE_THRESH_TEST = 0.5
+        predictor = DefaultPredictor(cfg)
+
         dataset_dicts = DatasetCatalog.get(self.val_dataset_name)
         dice_scores = []
 
         for data in dataset_dicts:
-            # --- Gestion du chemin de l'image ---
             img_path = data["file_name"]
-            if not os.path.isabs(img_path) or not os.path.exists(img_path):
-                img_path_candidate = os.path.join(self.image_root, os.path.basename(img_path))
-                if os.path.exists(img_path_candidate):
-                    img_path = img_path_candidate
+            if not os.path.isabs(img_path):
+                img_path = os.path.join(self.image_root, os.path.basename(img_path))
 
-            if not os.path.exists(img_path):
-                print(f"⚠️ Image introuvable, ignorée : {data['file_name']}")
-                continue
-
-            # --- Lecture de l'image ---
             img = cv2.imread(img_path)
             if img is None:
-                print(f"⚠️ Impossible de lire l'image : {data['file_name']}")
                 continue
 
-            # --- Prédiction ---
-            outputs = self.predictor_instance(img)["instances"].to("cpu")
+            outputs = predictor(img)["instances"].to("cpu")
 
-            # --- Masque prédictif ---
+            # --- masque prédictif (un seul masque)
             pred_mask = np.zeros(img.shape[:2], dtype=bool)
             if len(outputs) > 0:
-                for m in outputs.pred_masks.numpy():
-                    pred_mask |= m
+                scores = outputs.scores.numpy()
+                best_idx = np.argmax(scores)
+                pred_mask = outputs.pred_masks[best_idx].numpy()
 
-            # --- Masque vrai ---
+            # --- masque GT
             true_mask = np.zeros(img.shape[:2], dtype=bool)
             for ann in data["annotations"]:
                 segm = ann["segmentation"]
@@ -83,37 +79,25 @@ class DiceValidationHook(hooks.HookBase):
                         cv2.fillPoly(m, [poly_np.astype(np.int32)], 1)
                 true_mask |= m.astype(bool)
 
-            # --- Redimensionner le masque vrai pour correspondre au prédictif ---
-            pred_h, pred_w = pred_mask.shape
-            true_mask_resized = cv2.resize(
-                true_mask.astype(np.uint8),
-                (pred_w, pred_h),
-                interpolation=cv2.INTER_NEAREST
-            ).astype(bool)
-
-            # --- Calcul du Dice ---
-            intersection = (pred_mask & true_mask_resized).sum()
-            union = pred_mask.sum() + true_mask_resized.sum()
+            # --- Dice
+            intersection = (pred_mask & true_mask).sum()
+            union = pred_mask.sum() + true_mask.sum()
             dice = (2 * intersection) / union if union > 0 else 1.0
             dice_scores.append(dice)
 
-        # --- Moyenne Dice ---
         mean_dice = float(np.mean(dice_scores)) if dice_scores else 0.0
-        self.trainer.storage.put_scalar("validation/dice_score", mean_dice)
+        self.trainer.storage.put_scalar("validation/dice", mean_dice)
 
         print(f"Dice moyen: {mean_dice:.4f}")
 
-        if mean_dice > self._best_dice:
-            print(f"✅ Nouveau meilleur Dice ({self._best_dice:.4f} → {mean_dice:.4f})")
-            self._best_dice = mean_dice
+        if mean_dice > self.best_dice:
+            print(f" Nouveau meilleur Dice ({self.best_dice:.4f} → {mean_dice:.4f})")
+            self.best_dice = mean_dice
             self.trainer.checkpointer.save("model_best_dice")
         else:
-            print("⏸️ Pas d'amélioration")
+            print(" Pas d'amélioration")
 
         print(f"{'='*60}\n")
-
-
-
 
 
 
@@ -121,9 +105,8 @@ class DiceValidationHook(hooks.HookBase):
 # TRAINER PERSONNALISÉ
 # ======================================================
 class DiceTrainer(DefaultTrainer):
-    def __init__(self, cfg, val_image_root, predictor_instance, eval_period=200):
+    def __init__(self, cfg, val_image_root, eval_period=200):
         self.val_image_root = val_image_root
-        self.predictor_instance = predictor_instance
         self.eval_period = eval_period
         super().__init__(cfg)
 
@@ -135,11 +118,10 @@ class DiceTrainer(DefaultTrainer):
                 eval_period=self.eval_period,
                 val_dataset_name="uterus_val",
                 image_root=self.val_image_root,
-                predictor_instance=self.predictor_instance,
             )
         )
-
         return hooks_list
+
 
 
 # ======================================================
@@ -181,7 +163,7 @@ class UterusSegmentationTrainer:
         self.cfg.SOLVER.IMS_PER_BATCH = 16
         self.cfg.SOLVER.BASE_LR = 5e-4
         self.cfg.SOLVER.MAX_ITER = 1000
-
+        self.cfg.MODEL.ROI_HEADS.SCORE_THRESH_TEST = 0.5
         self.cfg.INPUT.FORMAT = "BGR"
         self.cfg.OUTPUT_DIR = "./output"
         Path(self.cfg.OUTPUT_DIR).mkdir(exist_ok=True)
@@ -208,11 +190,9 @@ class UterusSegmentationTrainer:
         MetadataCatalog.get("uterus_val").set(thing_classes=["uterus"])
 
     def train(self):
-        predictor = DefaultPredictor(self.cfg)
         trainer = DiceTrainer(
             self.cfg,
-            val_image_root=self.val_image_root,  # <-- chemin correct
-            predictor_instance=predictor,        # <-- on passe le predictor
+            val_image_root=self.val_image_root,
             eval_period=200
         )
         trainer.resume_or_load(resume=False)
