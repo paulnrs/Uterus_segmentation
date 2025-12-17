@@ -45,8 +45,19 @@ class DiceValidationHook(hooks.HookBase):
 
         for data in dataset_dicts:
             img_path = data["file_name"]
-            if not os.path.isabs(img_path):
-                img_path = os.path.join(self.image_root, img_path)
+
+            # Si le chemin n'est pas absolu ou le fichier n'existe pas, on complète avec image_root
+            if not os.path.isabs(img_path) or not os.path.exists(img_path):
+                img_path_candidate = os.path.join(self.image_root, os.path.basename(img_path))
+                if os.path.exists(img_path_candidate):
+                    img_path = img_path_candidate
+
+            # Si le fichier est toujours introuvable, on ignore cette image
+            if not os.path.exists(img_path):
+                print(f"⚠️ Image introuvable, ignorée : {data['file_name']}")
+                continue
+
+            img = cv2.imread(img_path)
 
             img = cv2.imread(img_path)
             if img is None:
