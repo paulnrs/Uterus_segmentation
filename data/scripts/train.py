@@ -26,6 +26,12 @@ from pycocotools.coco import COCO
 # ======================================================
 class DiceValidationHook(hooks.HookBase):
     def __init__(self, eval_period, val_dataset_name, image_root, score_thresh=0.5):
+        """
+        eval_period: fréquence (en itérations) pour calculer le Dice
+        val_dataset_name: nom du dataset enregistré (ex: 'uterus_val')
+        image_root: dossier contenant les images
+        score_thresh: seuil pour filtrer les prédictions
+        """
         self.eval_period = eval_period
         self.val_dataset_name = val_dataset_name
         self.image_root = image_root
@@ -35,15 +41,20 @@ class DiceValidationHook(hooks.HookBase):
     def after_step(self):
         next_iter = self.trainer.iter + 1
         if next_iter != 1 and next_iter % self.eval_period != 0:
-            return
+            return  # On n'évalue pas à cette itération
 
         print(f"\n{'='*60}")
         print(f"Validation Dice @ iter {next_iter}")
 
         model = self.trainer.model
-        model.eval()
+        model.eval()  # passage en mode évaluation
 
-        dataset_dicts = DatasetCatalog.get(self.val_dataset_name)
+        try:
+            dataset_dicts = DatasetCatalog.get(self.val_dataset_name)
+        except KeyError:
+            print(f"Erreur : Dataset '{self.val_dataset_name}' non trouvé.")
+            return
+
         dice_scores = []
 
         with torch.no_grad():
@@ -52,8 +63,8 @@ class DiceValidationHook(hooks.HookBase):
                 img = cv2.imread(img_path)
 
                 if img is None:
-                    print(f"⚠️ Image introuvable: {img_path}")
-                    continue
+                    print(f"⚠️ Image introuvable, ignorée : {img_path}")
+                    continue  # Ignore cette image
 
                 height, width = img.shape[:2]
 
@@ -65,7 +76,7 @@ class DiceValidationHook(hooks.HookBase):
 
                 outputs = model(inputs)[0]["instances"].to("cpu")
 
-                # -------- prédiction --------
+                # --- prédiction ---
                 pred_mask = np.zeros((height, width), dtype=bool)
                 if len(outputs) > 0:
                     high_conf = outputs.scores > self.score_thresh
@@ -73,19 +84,20 @@ class DiceValidationHook(hooks.HookBase):
                         for m in outputs.pred_masks[high_conf].numpy():
                             pred_mask |= m
 
-                # -------- ground truth --------
+                # --- vérité terrain ---
                 true_mask = np.zeros((height, width), dtype=bool)
                 for ann in data["annotations"]:
                     segm = ann["segmentation"]
-                    if isinstance(segm, dict):
+                    if isinstance(segm, dict):  # RLE
                         m = mask_util.decode(segm)
-                    else:
+                    else:  # Polygones
                         m = np.zeros((height, width), dtype=np.uint8)
                         for poly in segm:
                             poly_np = np.array(poly).reshape(-1, 2)
                             cv2.fillPoly(m, [poly_np.astype(np.int32)], 1)
                     true_mask |= m.astype(bool)
 
+                # --- calcul du Dice ---
                 intersection = (pred_mask & true_mask).sum()
                 union = pred_mask.sum() + true_mask.sum()
                 dice = (2 * intersection) / union if union > 0 else 1.0
@@ -94,7 +106,7 @@ class DiceValidationHook(hooks.HookBase):
         mean_dice = float(np.mean(dice_scores)) if dice_scores else 0.0
         self.trainer.storage.put_scalar("validation/dice_score", mean_dice)
 
-        print(f"Dice moyen: {mean_dice:.4f}")
+        print(f"Dice moyen sur {len(dice_scores)} images : {mean_dice:.4f}")
 
         if mean_dice > self._best_dice:
             print(f"✅ Nouveau meilleur Dice ({self._best_dice:.4f} → {mean_dice:.4f})")
@@ -104,8 +116,7 @@ class DiceValidationHook(hooks.HookBase):
             print("⏸️ Pas d'amélioration")
 
         print(f"{'='*60}\n")
-
-        model.train()
+        model.train()  # remettre en mode training
 
 
 
