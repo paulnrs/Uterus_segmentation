@@ -33,15 +33,18 @@ class DiceValidationHook(hooks.HookBase):
 
     def after_step(self):
         next_iter = self.trainer.iter + 1
-        if next_iter != 1 and next_iter % self.eval_period != 0:
+        if next_iter % self.eval_period != 0:
             return
 
         print(f"\n{'='*60}")
         print(f"Validation Dice @ iter {next_iter}")
 
-        #IMPORTANT : recharger les poids courants
         cfg = self.trainer.cfg.clone()
-        cfg.MODEL.WEIGHTS = self.trainer.checkpointer.get_checkpoint_file()
+        ckpt_path = self.trainer.checkpointer.get_checkpoint_file()
+        if ckpt_path is not None and os.path.isfile(ckpt_path):
+            cfg.MODEL.WEIGHTS = ckpt_path
+        else:
+            cfg.MODEL.WEIGHTS = self.trainer.cfg.MODEL.WEIGHTS
         cfg.MODEL.ROI_HEADS.SCORE_THRESH_TEST = 0.5
         predictor = DefaultPredictor(cfg)
 
