@@ -31,76 +31,66 @@ class DiceValidationHook(hooks.HookBase):
         self.image_root = image_root
         self.best_dice = 0.0
 
-    def after_step(self):
-        next_iter = self.trainer.iter + 1
-        if next_iter % self.eval_period != 0:
-            return
+    from detectron2.data import build_detection_test_loader
+from detectron2.data import DatasetMapper
 
-        print(f"\n{'='*60}")
-        print(f"Validation Dice @ iter {next_iter}")
+def after_step(self):
+    next_iter = self.trainer.iter + 1
+    if next_iter % self.eval_period != 0:
+        return
 
-        cfg = self.trainer.cfg.clone()
-        ckpt_path = self.trainer.checkpointer.get_checkpoint_file()
-        if ckpt_path is not None and os.path.isfile(ckpt_path):
-            cfg.MODEL.WEIGHTS = ckpt_path
-        else:
-            cfg.MODEL.WEIGHTS = self.trainer.cfg.MODEL.WEIGHTS
-        cfg.MODEL.ROI_HEADS.SCORE_THRESH_TEST = 0.5
-        predictor = DefaultPredictor(cfg)
+    print(f"\n{'='*60}")
+    print(f"Validation Dice @ iter {next_iter}")
 
-        dataset_dicts = DatasetCatalog.get(self.val_dataset_name)
-        dice_scores = []
+    model = self.trainer.model
+    model.eval()
 
-        for data in dataset_dicts:
-            img_path = data["file_name"]
-            if not os.path.isabs(img_path):
-                img_path = os.path.join(self.image_root, os.path.basename(img_path))
+    mapper = DatasetMapper(self.trainer.cfg, is_train=False)
+    data_loader = build_detection_test_loader(
+        self.trainer.cfg,
+        self.val_dataset_name,
+        mapper=mapper
+    )
 
-            img = cv2.imread(img_path)
-            if img is None:
-                continue
+    dice_scores = []
 
-            outputs = predictor(img)["instances"].to("cpu")
+    with torch.no_grad():
+        for batch in data_loader:
+            outputs = model(batch)
+            for inp, out in zip(batch, outputs):
+                img = inp["image"].permute(1, 2, 0).cpu().numpy()
 
-            # --- masque prédictif (un seul masque)
-            pred_mask = np.zeros(img.shape[:2], dtype=bool)
-            if len(outputs) > 0:
-                scores = outputs.scores.numpy()
-                best_idx = np.argmax(scores)
-                pred_mask = outputs.pred_masks[best_idx].numpy()
+                # prédiction
+                instances = out["instances"].to("cpu")
+                pred_mask = np.zeros(img.shape[:2], dtype=bool)
+                if len(instances) > 0:
+                    best = instances.scores.argmax()
+                    pred_mask = instances.pred_masks[best].numpy()
 
-            # --- masque GT
-            true_mask = np.zeros(img.shape[:2], dtype=bool)
-            for ann in data["annotations"]:
-                segm = ann["segmentation"]
-                if isinstance(segm, dict):
-                    m = mask_util.decode(segm)
-                else:
-                    m = np.zeros(img.shape[:2], dtype=np.uint8)
-                    for poly in segm:
-                        poly_np = np.array(poly).reshape(-1, 2)
-                        cv2.fillPoly(m, [poly_np.astype(np.int32)], 1)
-                true_mask |= m.astype(bool)
+                # GT
+                true_mask = np.zeros(img.shape[:2], dtype=bool)
+                for ann in inp["instances"].gt_masks.tensor:
+                    true_mask |= ann.numpy()
 
-            # --- Dice
-            intersection = (pred_mask & true_mask).sum()
-            union = pred_mask.sum() + true_mask.sum()
-            dice = (2 * intersection) / union if union > 0 else 1.0
-            dice_scores.append(dice)
+                intersection = (pred_mask & true_mask).sum()
+                union = pred_mask.sum() + true_mask.sum()
+                dice = (2 * intersection + 1e-6) / (union + 1e-6)
+                dice_scores.append(dice)
 
-        mean_dice = float(np.mean(dice_scores)) if dice_scores else 0.0
-        self.trainer.storage.put_scalar("validation/dice", mean_dice)
+    mean_dice = float(np.mean(dice_scores))
+    self.trainer.storage.put_scalar("validation/dice", mean_dice)
 
-        print(f"Dice moyen: {mean_dice:.4f}")
+    print(f"Dice moyen: {mean_dice:.4f}")
 
-        if mean_dice > self.best_dice:
-            print(f" Nouveau meilleur Dice ({self.best_dice:.4f} → {mean_dice:.4f})")
-            self.best_dice = mean_dice
-            self.trainer.checkpointer.save("model_best_dice")
-        else:
-            print(" Pas d'amélioration")
+    if mean_dice > self.best_dice:
+        print(f"✅ Nouveau meilleur Dice ({self.best_dice:.4f} → {mean_dice:.4f})")
+        self.best_dice = mean_dice
+        self.trainer.checkpointer.save("model_best_dice")
+    else:
+        print("⏸️ Pas d'amélioration")
 
-        print(f"{'='*60}\n")
+    print(f"{'='*60}\n")
+
 
 
 
@@ -166,7 +156,10 @@ class UterusSegmentationTrainer:
         self.cfg.SOLVER.IMS_PER_BATCH = 16
         self.cfg.SOLVER.BASE_LR = 5e-4
         self.cfg.SOLVER.MAX_ITER = 1000
-        self.cfg.MODEL.ROI_HEADS.SCORE_THRESH_TEST = 0.5
+        self.cfg.MODEL.ROI_HEADS.SCORE_THRESH_TEST = 0.01
+        self.cfg.MODEL.ROI_HEADS.NMS_THRESH_TEST = 0.8
+        self.cfg.MODEL.RPN.POST_NMS_TOPK_TEST = 2000
+        self.cfg.MODEL.RPN.PRE_NMS_TOPK_TEST = 4000
         self.cfg.INPUT.FORMAT = "BGR"
         self.cfg.OUTPUT_DIR = "./output"
         Path(self.cfg.OUTPUT_DIR).mkdir(exist_ok=True)
