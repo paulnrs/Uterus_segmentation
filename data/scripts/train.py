@@ -180,7 +180,7 @@ class UterusSegmentationTrainer:
 
         self.cfg.MODEL.DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
-    def register_datasets(self, train_json, train_imgs, val_json, val_imgs):
+    def register_datasets(self, train_json, train_imgs, val_json, val_imgs=""):
         for name in ("uterus_train", "uterus_val"):
             try:
                 DatasetCatalog.remove(name)
@@ -218,13 +218,13 @@ def main_training_pipeline() -> Tuple[DefaultTrainer, dict]:
     TRAIN_JSON = "data/train/annotations.json"
     TRAIN_IMAGES = "data/train/images"
     VAL_JSON = "data/val/annotations.json"
-    VAL_IMAGES = "data/val/images"
+    #VAL_IMAGES = "data/val/images"
 
     DatasetValidator(TRAIN_JSON, TRAIN_IMAGES).validate_dataset()
 
     trainer = UterusSegmentationTrainer()
     trainer.register_datasets(
-        TRAIN_JSON, TRAIN_IMAGES, VAL_JSON, VAL_IMAGES
+        TRAIN_JSON, TRAIN_IMAGES, VAL_JSON
     )
 
     trainer_instance = trainer.train()
