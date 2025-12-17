@@ -31,50 +31,56 @@ class DiceValidationHook(hooks.HookBase):
         self.image_root = image_root
         self.score_thresh = score_thresh
         self._best_dice = 0.0
-        self._predictor = None
 
     def after_step(self):
         next_iter = self.trainer.iter + 1
-        if next_iter % self.eval_period != 0:
+        if next_iter != 1 and next_iter % self.eval_period != 0:
             return
 
         print(f"\n{'='*60}")
         print(f"Validation Dice @ iter {next_iter}")
 
-        cfg = self.trainer.cfg.clone()
-        cfg.MODEL.WEIGHTS = self.trainer.checkpointer.get_checkpoint_file()
-        cfg.MODEL.ROI_HEADS.SCORE_THRESH_TEST = self.score_thresh
-        predictor = DefaultPredictor(cfg)
+        model = self.trainer.model
+        model.eval()
 
         dataset_dicts = DatasetCatalog.get(self.val_dataset_name)
         dice_scores = []
 
         with torch.no_grad():
             for data in dataset_dicts:
-                file_name = data["file_name"]
-                if os.path.exists(file_name):
-                    img_path = file_name
-                else:
-                    img_path = os.path.join(self.image_root, os.path.basename(file_name))
-
+                img_path = os.path.join(self.image_root, data["file_name"])
                 img = cv2.imread(img_path)
+
                 if img is None:
                     print(f"⚠️ Image introuvable: {img_path}")
                     continue
 
-                outputs = predictor(img)["instances"].to("cpu")
+                height, width = img.shape[:2]
 
-                pred_mask = np.zeros(img.shape[:2], dtype=bool)
-                for m in outputs.pred_masks.numpy():
-                    pred_mask |= m
+                inputs = [{
+                    "image": torch.as_tensor(img.astype("float32")).permute(2, 0, 1),
+                    "height": height,
+                    "width": width,
+                }]
 
-                true_mask = np.zeros(img.shape[:2], dtype=bool)
+                outputs = model(inputs)[0]["instances"].to("cpu")
+
+                # -------- prédiction --------
+                pred_mask = np.zeros((height, width), dtype=bool)
+                if len(outputs) > 0:
+                    high_conf = outputs.scores > self.score_thresh
+                    if high_conf.any():
+                        for m in outputs.pred_masks[high_conf].numpy():
+                            pred_mask |= m
+
+                # -------- ground truth --------
+                true_mask = np.zeros((height, width), dtype=bool)
                 for ann in data["annotations"]:
                     segm = ann["segmentation"]
                     if isinstance(segm, dict):
                         m = mask_util.decode(segm)
                     else:
-                        m = np.zeros(img.shape[:2], dtype=np.uint8)
+                        m = np.zeros((height, width), dtype=np.uint8)
                         for poly in segm:
                             poly_np = np.array(poly).reshape(-1, 2)
                             cv2.fillPoly(m, [poly_np.astype(np.int32)], 1)
@@ -98,6 +104,9 @@ class DiceValidationHook(hooks.HookBase):
             print("⏸️ Pas d'amélioration")
 
         print(f"{'='*60}\n")
+
+        model.train()
+
 
 
 
