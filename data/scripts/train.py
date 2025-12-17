@@ -1,7 +1,7 @@
 from __future__ import annotations
 from pathlib import Path
 from typing import Tuple
-
+import cv2 
 import numpy as np
 import torch
 
@@ -87,33 +87,22 @@ class DiceEvaluator(DatasetEvaluator):
         for inp, out in zip(inputs, outputs):
             h, w = inp["height"], inp["width"]
 
+            # ✅ DEBUG : Vérifier les prédictions
+            num_preds = len(out["instances"])
+            if num_preds > 0:
+                scores = out["instances"].scores.cpu().numpy()
+                print(f"  → {num_preds} prédictions (scores: {scores.min():.3f} - {scores.max():.3f})")
+            
             if len(out["instances"]) == 0:
                 pred_mask = np.zeros((h, w), dtype=bool)
             else:
                 pred_masks = out["instances"].pred_masks.cpu().numpy()
                 pred_mask = pred_masks.any(axis=0)
 
-            gt_mask = np.zeros((h, w), dtype=bool)
-            for ann in inp.get("annotations", []):
-                if "segmentation" not in ann:
-                    continue
-                seg = ann["segmentation"]
-                if isinstance(seg, list):
-                    rle = mask_util.frPyObjects(seg, h, w)
-                    m = mask_util.decode(rle)
-                    if m.ndim == 3:
-                        m = m.any(axis=2)
-                    gt_mask |= m
-                elif isinstance(seg, dict):
-                    if isinstance(seg.get("counts"), list):
-                        seg = mask_util.frPyObjects([seg], h, w)[0]
-                    m = mask_util.decode(seg)
-                    gt_mask |= m
-
-            inter = np.logical_and(pred_mask, gt_mask).sum()
-            union = pred_mask.sum() + gt_mask.sum()
-            dice = (2 * inter / union) if union > 0 else 0.0
-            self.dices.append(dice)
+            # ... reste du code GT mask ...
+            
+            # ✅ DEBUG : Vérifier les masques
+            print(f"  → Pred pixels: {pred_mask.sum()}, GT pixels: {gt_mask.sum()}")
 
     def evaluate(self):
         if not self.dices:
@@ -161,7 +150,7 @@ class DiceTrainer(DefaultTrainer):
         )
         
         early_stop = EarlyStoppingHook(
-            patience=2,
+            patience=10,
             metric_name="dice",
             mode="max"
         )
@@ -206,7 +195,7 @@ class UterusSegmentationTrainer:
         self.cfg.SOLVER.GAMMA = 0.1
 
         self.cfg.MODEL.ROI_HEADS.BATCH_SIZE_PER_IMAGE = 512
-        self.cfg.MODEL.ROI_HEADS.SCORE_THRESH_TEST = 0.01
+        self.cfg.MODEL.ROI_HEADS.SCORE_THRESH_TEST = 0.0
         self.cfg.MODEL.ROI_HEADS.NMS_THRESH_TEST = 0.5
 
         self.cfg.MODEL.RPN.PRE_NMS_TOPK_TRAIN = 2000
