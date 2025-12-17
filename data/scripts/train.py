@@ -32,7 +32,7 @@ class DiceValidationHook(hooks.HookBase):
     Sauvegarde le modèle seulement si le Dice s'améliore.
     """
     def __init__(self, eval_period: int, val_dataset_name: str, 
-                 image_root: str, score_thresh: float = 0.5):
+                 image_root: str, score_thresh: float = 0.7):  # ← Augmenté à 0.7
         self.eval_period = eval_period
         self.val_dataset_name = val_dataset_name
         self.image_root = image_root
@@ -55,8 +55,16 @@ class DiceValidationHook(hooks.HookBase):
 
         with torch.no_grad():
             for data in tqdm(dataset_dicts, desc="Validation Dice"):
-                # Construire le chemin complet
-                img_path = os.path.join(self.image_root, data["file_name"])
+                # Construire le chemin - gérer les chemins absolus et relatifs
+                file_name = data["file_name"]
+                
+                # Si le file_name contient déjà le chemin complet, l'utiliser directement
+                if os.path.isabs(file_name) or file_name.startswith("data/"):
+                    img_path = file_name
+                else:
+                    # Sinon, ajouter le image_root
+                    img_path = os.path.join(self.image_root, file_name)
+                
                 img = cv2.imread(img_path)
                 
                 if img is None:
@@ -79,14 +87,21 @@ class DiceValidationHook(hooks.HookBase):
                 # Inférence
                 outputs = self.trainer.model(inputs)[0]["instances"].to("cpu")
 
-                # Masque de prédiction
+                # Masque de prédiction avec filtrage
                 pred_mask = np.zeros((height, width), dtype=bool)
                 if len(outputs) > 0:
                     high_conf = outputs.scores > self.score_thresh
                     if high_conf.sum() > 0:
                         masks = outputs.pred_masks[high_conf].numpy()
-                        for m in masks:
-                            pred_mask |= m
+                        areas = outputs.pred_masks[high_conf].sum(dim=(1, 2)).numpy()
+                        
+                        # Filtrer les masques trop petits (probablement des FP)
+                        min_area = 1000  # pixels - ajustez selon votre dataset
+                        max_area = height * width * 0.8  # max 80% de l'image
+                        
+                        for m, area in zip(masks, areas):
+                            if min_area <= area <= max_area:
+                                pred_mask |= m
 
                 # Masque ground truth
                 true_mask = np.zeros((height, width), dtype=bool)
@@ -199,7 +214,7 @@ class DiceTrainer(DefaultTrainer):
                 eval_period=self.eval_period,
                 val_dataset_name="uterus_val",
                 image_root=self.val_image_root,
-                score_thresh=0.5,
+                score_thresh=0.7,  # ← Score élevé pour haute précision
             )
         )
         
@@ -319,10 +334,22 @@ class UterusSegmentationTrainer:
         
         # Configuration du modèle
         self.cfg.MODEL.ROI_HEADS.NUM_CLASSES = 1
+        
+        # === PARAMÈTRES POUR HAUTE PRÉCISION (↓FP, ↑VP) ===
+        self.cfg.MODEL.ROI_HEADS.SCORE_THRESH_TEST = 0.7  # ← Augmenté de 0.5 à 0.7
+        self.cfg.MODEL.ROI_HEADS.NMS_THRESH_TEST = 0.5    # Garder par défaut
+        self.cfg.TEST.DETECTIONS_PER_IMAGE = 100          # Limite les détections
+        
+        # RPN plus strict
+        self.cfg.MODEL.RPN.POST_NMS_TOPK_TEST = 500       # Réduit de 1000
+        self.cfg.MODEL.RPN.PRE_NMS_TOPK_TEST = 1000       # Réduit de 2000
+        
+        # Solver
         self.cfg.SOLVER.IMS_PER_BATCH = 16
         self.cfg.SOLVER.BASE_LR = 0.0005
         self.cfg.SOLVER.MAX_ITER = 1000
         self.cfg.SOLVER.GAMMA = 0.1
+        self.cfg.SOLVER.WEIGHT_DECAY = 0.0001             # Régularisation L2
         
         # Configuration des images
         self.cfg.INPUT.MIN_SIZE_TRAIN = (640, 672, 704, 736, 768, 800)
@@ -330,6 +357,9 @@ class UterusSegmentationTrainer:
         self.cfg.INPUT.MAX_SIZE_TRAIN = 1333
         self.cfg.INPUT.MAX_SIZE_TEST = 1333
         self.cfg.INPUT.FORMAT = "RGB"
+        
+        # Augmentation de données (aide à réduire les FP)
+        self.cfg.INPUT.RANDOM_FLIP = "horizontal"
         
         # Augmentation de test
         self.cfg.TEST.AUG.ENABLED = False
