@@ -83,6 +83,8 @@ class EarlyStoppingHook(hooks.HookBase):
 class DiceEvaluator(DatasetEvaluator):
     def reset(self):
         self.dices = []
+        self.total_preds = 0
+        self.total_gts = 0
 
     def process(self, inputs, outputs):
         for inp, out in zip(inputs, outputs):
@@ -112,6 +114,10 @@ class DiceEvaluator(DatasetEvaluator):
 
             gt_mask = gt_mask.astype(bool)
             
+            # Compteurs
+            self.total_preds += pred_mask.sum()
+            self.total_gts += gt_mask.sum()
+            
             # Calcul du Dice
             inter = np.logical_and(pred_mask, gt_mask).sum()
             union = pred_mask.sum() + gt_mask.sum()
@@ -133,6 +139,8 @@ class DiceEvaluator(DatasetEvaluator):
             print(f"Max Dice : {np.max(self.dices):.4f}")
             print(f"Std Dice : {np.std(self.dices):.4f}")
             print(f"N images : {len(self.dices)}")
+            print(f"Total PRED pixels: {self.total_preds:,}")
+            print(f"Total GT pixels  : {self.total_gts:,}")
             print(f"{'='*60}\n")
 
         return {"dice": mean_dice}
@@ -140,7 +148,9 @@ class DiceEvaluator(DatasetEvaluator):
 
 def dice_eval_fn(cfg, model):
     evaluator = DiceEvaluator()
-    mapper = DatasetMapper(cfg, is_train=False)
+    # ✅ Forcer le chargement des annotations
+    from detectron2.data import DatasetMapper
+    mapper = DatasetMapper(cfg, is_train=False, augmentations=[])
     loader = build_detection_test_loader(cfg, cfg.DATASETS.TEST[0], mapper=mapper)
     results = inference_on_dataset(model, loader, evaluator)
     return results
