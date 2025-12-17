@@ -1,319 +1,156 @@
-"""Training pipeline for Detectron2 uterus segmentation."""
+"""
+Training pipeline for Detectron2 uterus segmentation
+VALIDATION ONLINE = IDENTIQUE VALIDATION OFFLINE
+"""
 
 from __future__ import annotations
 import os
-import random
 from pathlib import Path
 from typing import Optional, Tuple
 
 import cv2
-import matplotlib.pyplot as plt
 import numpy as np
-from matplotlib.patches import Rectangle
 import torch
+
 from detectron2 import model_zoo
 from detectron2.config import get_cfg
 from detectron2.data import DatasetCatalog, MetadataCatalog
 from detectron2.data.datasets import register_coco_instances
-from detectron2.engine import DefaultTrainer, hooks
-from pycocotools.coco import COCO
+from detectron2.engine import DefaultTrainer, hooks, DefaultPredictor
 from pycocotools import mask as mask_util
-from tqdm import tqdm
-
-from evaluate import UterusSegmentationInference
+from pycocotools.coco import COCO
 
 
-# ====================
-# Validation Hook
-# ====================
+# ======================================================
+# VALIDATION DICE HOOK (ALIGNÉ OFFLINE)
+# ======================================================
 class DiceValidationHook(hooks.HookBase):
-    """
-    Exécute la validation toutes les `eval_period` itérations.
-    Sauvegarde le modèle seulement si le Dice s'améliore.
-    """
-    def __init__(self, eval_period: int, val_dataset_name: str, 
-                 image_root: str, score_thresh: float = 0.5):
+    def __init__(self, eval_period, val_dataset_name, image_root, score_thresh=0.5):
         self.eval_period = eval_period
         self.val_dataset_name = val_dataset_name
         self.image_root = image_root
         self.score_thresh = score_thresh
         self._best_dice = 0.0
+        self._predictor = None
 
     def after_step(self):
-        """Appelé après chaque itération d'entraînement."""
         next_iter = self.trainer.iter + 1
-        
-        # Validation périodique uniquement
         if next_iter % self.eval_period != 0:
             return
 
-        # Passer en mode évaluation
-        self.trainer.model.eval()
-        
+        print(f"\n{'='*60}")
+        print(f"Validation Dice @ iter {next_iter}")
+
+        cfg = self.trainer.cfg.clone()
+        cfg.MODEL.WEIGHTS = self.trainer.checkpointer.get_checkpoint_file()
+        cfg.MODEL.ROI_HEADS.SCORE_THRESH_TEST = self.score_thresh
+        predictor = DefaultPredictor(cfg)
+
         dataset_dicts = DatasetCatalog.get(self.val_dataset_name)
         dice_scores = []
 
         with torch.no_grad():
-            for data in tqdm(dataset_dicts, desc="Validation Dice"):
+            for data in dataset_dicts:
                 file_name = data["file_name"]
-                
-                # Stratégie de construction du chemin
-                if self.image_root == "":
+                if os.path.exists(file_name):
                     img_path = file_name
                 else:
                     img_path = os.path.join(self.image_root, os.path.basename(file_name))
-                
+
                 img = cv2.imread(img_path)
-                
                 if img is None:
-                    print(f"⚠️ Image introuvable:")
-                    print(f"   file_name: {file_name}")
-                    print(f"   img_path: {img_path}")
+                    print(f"⚠️ Image introuvable: {img_path}")
                     continue
 
-                # NE PAS convertir BGR → RGB manuellement !
-                # Detectron2 le fait automatiquement en interne
-                height, width = img.shape[:2]
+                outputs = predictor(img)["instances"].to("cpu")
 
-                # Préparer l'input - laisser l'image en BGR (format OpenCV natif)
-                inputs = [{
-                    "image": torch.as_tensor(img.astype("float32")).permute(2, 0, 1),
-                    "height": height,
-                    "width": width
-                }]
-                
-                # Inférence
-                outputs = self.trainer.model(inputs)[0]["instances"].to("cpu")
+                pred_mask = np.zeros(img.shape[:2], dtype=bool)
+                for m in outputs.pred_masks.numpy():
+                    pred_mask |= m
 
-                # Masque de prédiction - comme dans le code offline qui marche
-                pred_mask = np.zeros((height, width), dtype=bool)
-                if len(outputs) > 0:
-                    high_conf = outputs.scores > self.score_thresh
-                    if high_conf.sum() > 0:
-                        masks = outputs.pred_masks[high_conf].numpy()
-                        for m in masks:
-                            pred_mask |= m
-
-                # Masque ground truth
-                true_mask = np.zeros((height, width), dtype=bool)
-                for ann in data.get("annotations", []):
+                true_mask = np.zeros(img.shape[:2], dtype=bool)
+                for ann in data["annotations"]:
                     segm = ann["segmentation"]
-                    
-                    if isinstance(segm, dict):  # RLE
+                    if isinstance(segm, dict):
                         m = mask_util.decode(segm)
-                    elif isinstance(segm, list):  # Polygones
-                        m = np.zeros((height, width), dtype=np.uint8)
-                        for poly in segm:
-                            if len(poly) >= 6:
-                                poly_np = np.array(poly).reshape(-1, 2)
-                                cv2.fillPoly(m, [poly_np.astype(np.int32)], 1)
                     else:
-                        continue
-                    
+                        m = np.zeros(img.shape[:2], dtype=np.uint8)
+                        for poly in segm:
+                            poly_np = np.array(poly).reshape(-1, 2)
+                            cv2.fillPoly(m, [poly_np.astype(np.int32)], 1)
                     true_mask |= m.astype(bool)
 
-                # Calcul du Dice
                 intersection = (pred_mask & true_mask).sum()
                 union = pred_mask.sum() + true_mask.sum()
-                
-                if union > 0:
-                    dice = (2.0 * intersection) / union
-                else:
-                    dice = 1.0 if pred_mask.sum() == 0 else 0.0
-                
+                dice = (2 * intersection) / union if union > 0 else 1.0
                 dice_scores.append(dice)
 
-        # Calculer la moyenne
         mean_dice = float(np.mean(dice_scores)) if dice_scores else 0.0
-        
-        # Logger
         self.trainer.storage.put_scalar("validation/dice_score", mean_dice)
-        
-        print(f"\n{'='*60}")
-        print(f"Validation @ iter {next_iter}")
-        print(f"  Dice Score: {mean_dice:.4f}")
-        print(f"  Samples: {len(dice_scores)}")
-        
-        # Sauvegarde conditionnelle
+
+        print(f"Dice moyen: {mean_dice:.4f}")
+
         if mean_dice > self._best_dice:
-            print(f"  ✅ Amélioration ! {self._best_dice:.4f} → {mean_dice:.4f}")
+            print(f"✅ Nouveau meilleur Dice ({self._best_dice:.4f} → {mean_dice:.4f})")
             self._best_dice = mean_dice
             self.trainer.checkpointer.save("model_best_dice")
         else:
-            print(f"  ⏸️  Pas d'amélioration ({mean_dice:.4f} <= {self._best_dice:.4f})")
-        
+            print("⏸️ Pas d'amélioration")
+
         print(f"{'='*60}\n")
 
-        # Retour en mode entraînement
-        self.trainer.model.train()
 
 
-# ====================
-# Early Stopping Hook
-# ====================
-class DiceEarlyStoppingHook(hooks.HookBase):
-    def __init__(self, patience: int = 5):
-        self.patience = patience
-        self._best_dice = 0.0
-        self._best_iter = -1
-        self._no_improvement_count = 0
-
-    def after_step(self):
-        try:
-            history = self.trainer.storage.history("validation/dice_score")
-        except KeyError:
-            return
-        
-        if not history:
-            return
-
-        dice_score = history.latest()[0]
-        current_iter = self.trainer.iter
-
-        if dice_score > self._best_dice:
-            self._best_dice = dice_score
-            self._best_iter = current_iter
-            self._no_improvement_count = 0
-        else:
-            self._no_improvement_count += 1
-            
-            if self._no_improvement_count >= self.patience:
-                print(f"\n{'='*60}")
-                print(f"EARLY STOPPING")
-                print(f"Best Dice: {self._best_dice:.4f} (iter {self._best_iter})")
-                print(f"Pas d'amélioration depuis {self.patience} validations")
-                print(f"{'='*60}\n")
-                self.trainer.checkpointer.save("model_early_stopped")
-                raise StopIteration
-
-
-# ====================
-# Trainer avec validation Dice
-# ====================
+# ======================================================
+# TRAINER PERSONNALISÉ
+# ======================================================
 class DiceTrainer(DefaultTrainer):
-    def __init__(self, cfg, val_image_root: str, eval_period: int = 200):
-        self.eval_period = eval_period
+    def __init__(self, cfg, val_image_root, eval_period=200):
         self.val_image_root = val_image_root
+        self.eval_period = eval_period
         super().__init__(cfg)
 
     def build_hooks(self):
         hooks_list = super().build_hooks()
-        
-        # Validation Dice
+
         hooks_list.append(
             DiceValidationHook(
                 eval_period=self.eval_period,
                 val_dataset_name="uterus_val",
                 image_root=self.val_image_root,
-                score_thresh=0.5,  # Ajustez selon vos besoins (0.5-0.7)
+                score_thresh=0.5,
             )
         )
-        
-        # Sauvegarde périodique
-        hooks_list.append(
-            hooks.PeriodicCheckpointer(
-                checkpointer=self.checkpointer,
-                period=500,
-                max_iter=self.cfg.SOLVER.MAX_ITER
-            )
-        )
-        
+
         return hooks_list
 
 
-# ====================
-# Dataset Validator
-# ====================
+# ======================================================
+# DATASET VALIDATOR (OPTIONNEL MAIS UTILE)
+# ======================================================
 class DatasetValidator:
-    def __init__(self, annotations_path: str, images_dir: str) -> None:
-        self.annotations_path = Path(annotations_path)
+    def __init__(self, annotations_path, images_dir):
+        self.coco = COCO(annotations_path)
         self.images_dir = Path(images_dir)
-        self.coco = COCO(str(self.annotations_path))
 
-    def validate_dataset(self) -> None:
-        print("=" * 60)
-        print("VALIDATION DU DATASET")
-        print("=" * 60)
-        print("\nStatistiques générales:")
-        print(f" • Nombre d'images: {len(self.coco.imgs)}")
-        print(f" • Nombre d'annotations: {len(self.coco.anns)}")
-        categories = [cat["name"] for cat in self.coco.cats.values()]
-        print(f" • Catégories: {categories}")
-        
-        missing_images = []
-        for img_info in self.coco.imgs.values():
-            img_path = self.images_dir / img_info["file_name"]
-            if not img_path.exists():
-                missing_images.append(img_info["file_name"])
-        
-        if missing_images:
-            print(f"\n⚠️ Images manquantes: {len(missing_images)}")
-            for img in missing_images[:5]:
-                print(f" - {img}")
-        else:
-            print("\n✅ Toutes les images sont présentes")
-        
-        self._analyze_annotations()
-
-    def _analyze_annotations(self) -> None:
-        areas = []
-        num_points = []
-        
-        for ann in self.coco.anns.values():
-            areas.append(ann.get("area", 0))
-            if "segmentation" in ann and isinstance(ann["segmentation"], list):
-                for seg in ann["segmentation"]:
-                    num_points.append(len(seg) // 2)
-        
-        print("\nAnalyse des annotations:")
-        if areas:
-            print(f" • Aire moyenne: {np.mean(areas):.0f} pixels²")
-            print(f" • Aire min/max: {min(areas):.0f} / {max(areas):.0f}")
-        
-        if num_points:
-            print(f" • Points moyens par polygone: {np.mean(num_points):.1f}")
-        
-        issues = self._check_annotation_issues()
-        if issues:
-            print(f"\n⚠️ Problèmes détectés: {len(issues)}")
-            for issue in issues[:10]:
-                print(f" - {issue}")
-        else:
-            print("\n✅ Aucune anomalie détectée")
-
-    def _check_annotation_issues(self) -> list[str]:
-        issues = []
-        
-        for ann_id, ann in self.coco.anns.items():
-            if "segmentation" in ann and isinstance(ann["segmentation"], list):
-                for idx, seg in enumerate(ann["segmentation"]):
-                    if len(seg) < 6:
-                        issues.append(f"Ann {ann_id}: polygone {idx} avec < 3 points")
-                    if len(seg) % 2 != 0:
-                        issues.append(f"Ann {ann_id}: polygone {idx} coordonnées impaires")
-            
-            area = ann.get("area", 0)
-            if area <= 0:
-                issues.append(f"Ann {ann_id}: aire invalide ({area})")
-            
-            bbox = ann.get("bbox", [])
-            if len(bbox) != 4:
-                issues.append(f"Ann {ann_id}: bbox invalide")
-            elif any(v < 0 for v in bbox):
-                issues.append(f"Ann {ann_id}: bbox négative")
-        
-        return issues
+    def validate_dataset(self):
+        print("\nValidation du dataset...")
+        missing = 0
+        for img in self.coco.imgs.values():
+            if not (self.images_dir / img["file_name"]).exists():
+                missing += 1
+        print(f"Images manquantes: {missing}")
 
 
-# ====================
-# Trainer principal
-# ====================
+# ======================================================
+# TRAINING PIPELINE
+# ======================================================
 class UterusSegmentationTrainer:
-    def __init__(self, config_params: Optional[dict] = None) -> None:
+    def __init__(self):
         self.cfg = get_cfg()
-        self.setup_config(config_params)
+        self._setup_cfg()
 
-    def setup_config(self, params: Optional[dict] = None) -> None:
+    def _setup_cfg(self):
         self.cfg.merge_from_file(
             model_zoo.get_config_file(
                 "COCO-InstanceSegmentation/mask_rcnn_R_50_FPN_3x.yaml"
@@ -322,253 +159,72 @@ class UterusSegmentationTrainer:
         self.cfg.MODEL.WEIGHTS = model_zoo.get_checkpoint_url(
             "COCO-InstanceSegmentation/mask_rcnn_R_50_FPN_3x.yaml"
         )
-        
-        # Configuration du modèle
-        self.cfg.MODEL.ROI_HEADS.NUM_CLASSES = 1
-        
-        # Paramètres de base
-        self.cfg.SOLVER.IMS_PER_BATCH = 16
-        self.cfg.SOLVER.BASE_LR = 0.0005
-        self.cfg.SOLVER.MAX_ITER = 1000
-        self.cfg.SOLVER.GAMMA = 0.1
-        self.cfg.SOLVER.WEIGHT_DECAY = 0.0001
-        
-        # Configuration des images
-        self.cfg.INPUT.MIN_SIZE_TRAIN = (640, 672, 704, 736, 768, 800)
-        self.cfg.INPUT.MIN_SIZE_TEST = 800
-        self.cfg.INPUT.MAX_SIZE_TRAIN = 1333
-        self.cfg.INPUT.MAX_SIZE_TEST = 1333
-        self.cfg.INPUT.FORMAT = "RGB"  # Format interne, mais on passe du BGR
-        self.cfg.INPUT.RANDOM_FLIP = "horizontal"
-        
-        # Augmentation de test
-        self.cfg.TEST.AUG.ENABLED = False
-        
-        # Répertoire de sortie
-        self.cfg.OUTPUT_DIR = "./output"
-        Path(self.cfg.OUTPUT_DIR).mkdir(parents=True, exist_ok=True)
-        
-        # Device
-        device = "cuda" if torch.cuda.is_available() else "cpu"
-        self.cfg.MODEL.DEVICE = device
-        
-        if device == "cuda" and torch.cuda.device_count() > 1:
-            print(f"🚀 Utilisation de {torch.cuda.device_count()} GPU(s)")
-        
-        if params:
-            for key, value in params.items():
-                setattr(self.cfg, key, value)
 
-    def register_datasets(
-        self, train_json: str, train_imgs: str, val_json: str, val_imgs: str
-    ) -> None:
-        print("\n" + "="*60)
-        print("🔍 DIAGNOSTIC DES CHEMINS")
-        print("="*60)
-        
-        # Vérifier les fichiers JSON
-        print(f"\n📄 Fichiers JSON:")
-        print(f"  Train: {train_json} {'✅' if Path(train_json).exists() else '❌ INTROUVABLE'}")
-        print(f"  Val:   {val_json} {'✅' if Path(val_json).exists() else '❌ INTROUVABLE'}")
-        
-        # Vérifier les dossiers d'images
-        print(f"\n📁 Dossiers d'images:")
-        print(f"  Train: {train_imgs} {'✅' if Path(train_imgs).exists() else '❌ INTROUVABLE'}")
-        print(f"  Val:   {val_imgs} {'✅' if Path(val_imgs).exists() else '❌ INTROUVABLE'}")
-        
-        # Nettoyer les anciens datasets
+        self.cfg.MODEL.ROI_HEADS.NUM_CLASSES = 1
+        self.cfg.SOLVER.IMS_PER_BATCH = 16
+        self.cfg.SOLVER.BASE_LR = 5e-4
+        self.cfg.SOLVER.MAX_ITER = 1000
+
+        self.cfg.INPUT.FORMAT = "BGR"
+        self.cfg.OUTPUT_DIR = "./output"
+        Path(self.cfg.OUTPUT_DIR).mkdir(exist_ok=True)
+
+        self.cfg.MODEL.DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+
+    def register_datasets(self, train_json, train_imgs, val_json, val_imgs):
         for name in ("uterus_train", "uterus_val"):
             try:
                 DatasetCatalog.remove(name)
                 MetadataCatalog.remove(name)
             except KeyError:
                 pass
-        
-        # Enregistrer les datasets
+
         register_coco_instances("uterus_train", {}, train_json, train_imgs)
         register_coco_instances("uterus_val", {}, val_json, val_imgs)
-        
+
         self.cfg.DATASETS.TRAIN = ("uterus_train",)
-        self.cfg.DATASETS.VAL = ("uterus_val",)
-        
-        # DIAGNOSTIC APPROFONDI du dataset de validation
-        print(f"\n🔬 Inspection du dataset de validation:")
-        val_dicts = DatasetCatalog.get("uterus_val")
-        
-        if len(val_dicts) == 0:
-            print("  ❌ ERREUR: Dataset vide!")
-            return
-        
-        print(f"  Nombre d'images: {len(val_dicts)}")
-        
-        # Examiner le premier fichier
-        first_file = val_dicts[0]
-        file_name = first_file["file_name"]
-        
-        print(f"\n  Premier fichier:")
-        print(f"    file_name (JSON): '{file_name}'")
-        print(f"    Type: {'Chemin absolu' if os.path.isabs(file_name) else 'Chemin relatif'}")
-        print(f"    Commence par 'data/': {file_name.startswith('data/')}")
-        
-        # Tester différentes combinaisons de chemins
-        print(f"\n  Tests de chemins:")
-        
-        # Test 1: file_name tel quel
-        test1 = file_name
-        exists1 = os.path.exists(test1)
-        print(f"    1. '{test1}' → {'✅ EXISTE' if exists1 else '❌ INTROUVABLE'}")
-        
-        # Test 2: image_root + file_name
-        test2 = os.path.join(val_imgs, file_name)
-        exists2 = os.path.exists(test2)
-        print(f"    2. '{test2}' → {'✅ EXISTE' if exists2 else '❌ INTROUVABLE'}")
-        
-        # Test 3: Extraire juste le nom de fichier
-        test3 = os.path.join(val_imgs, os.path.basename(file_name))
-        exists3 = os.path.exists(test3)
-        print(f"    3. '{test3}' → {'✅ EXISTE' if exists3 else '❌ INTROUVABLE'}")
-        
-        # Décider quelle stratégie utiliser
-        print(f"\n  📌 Stratégie choisie:")
-        if exists1:
-            print(f"    ✅ Utiliser file_name tel quel (déjà complet)")
-            self.val_image_root = ""
-        elif exists3:
-            print(f"    ✅ Utiliser basename(file_name) + image_root")
-            self.val_image_root = val_imgs
-            print(f"    ⚠️  ATTENTION: vos file_name contiennent des chemins qui seront ignorés")
-        elif exists2:
-            print(f"    ✅ Utiliser image_root + file_name")
-            self.val_image_root = val_imgs
-        else:
-            print(f"    ❌ ERREUR: Aucune stratégie ne fonctionne!")
-            print(f"    💡 Vérifiez que vos images sont bien dans '{val_imgs}'")
-            self.val_image_root = val_imgs
-        
-        # Compter combien de fichiers existent réellement
-        print(f"\n  🔍 Vérification complète...")
-        existing_count = 0
-        missing_files = []
-        
-        for i, d in enumerate(val_dicts[:10]):  # Vérifier les 10 premiers
-            fn = d["file_name"]
-            if self.val_image_root == "":
-                path = fn
-            else:
-                path = os.path.join(self.val_image_root, os.path.basename(fn))
-            
-            if os.path.exists(path):
-                existing_count += 1
-            else:
-                missing_files.append(fn)
-        
-        print(f"    Échantillon (10 premiers): {existing_count}/10 fichiers trouvés")
-        if missing_files:
-            print(f"    Fichiers manquants:")
-            for mf in missing_files[:3]:
-                print(f"      - {mf}")
-        
-        print(f"\n  ✅ image_root final: '{self.val_image_root}'")
-        
-        # Métadonnées
+        self.cfg.DATASETS.TEST = ()
+
+        self.val_image_root = val_imgs
+
         MetadataCatalog.get("uterus_train").set(thing_classes=["uterus"])
         MetadataCatalog.get("uterus_val").set(thing_classes=["uterus"])
-        
-        print("\n" + "="*60)
-        print("✅ Datasets enregistrés avec succès")
-        print("="*60 + "\n")
 
     def train(self):
-        print("\n" + "=" * 60)
-        print("DÉBUT DE L'ENTRAÎNEMENT")
-        print("=" * 60)
-
         trainer = DiceTrainer(
-            cfg=self.cfg,
+            self.cfg,
             val_image_root=self.val_image_root,
-            eval_period=200
+            eval_period=200,
         )
-
         trainer.resume_or_load(resume=False)
-
-        print(f"\nParamètres d'entraînement:")
-        print(f"  • Max iterations: {self.cfg.SOLVER.MAX_ITER}")
-        print(f"  • Learning rate: {self.cfg.SOLVER.BASE_LR}")
-        print(f"  • Batch size: {self.cfg.SOLVER.IMS_PER_BATCH}")
-        print(f"  • Validation Dice: toutes les 200 iterations")
-        print(f"  • Output: {self.cfg.OUTPUT_DIR}")
-
-        try:
-            trainer.train()
-        except StopIteration:
-            print("Entraînement arrêté par early stopping")
-        
+        trainer.train()
         trainer.checkpointer.save("model_final")
-        print("\n✅ Entraînement terminé !")
-        
         return trainer
 
 
-# ====================
-# Pipeline principale
-# ====================
+# ======================================================
+# MAIN
+# ======================================================
 def main_training_pipeline() -> Tuple[DefaultTrainer, dict]:
-    TRAIN_ANNOTATIONS = "data/train/annotations.json"
+    TRAIN_JSON = "data/train/annotations.json"
     TRAIN_IMAGES = "data/train/images"
-    VAL_ANNOTATIONS = "data/val/annotations.json"
+    VAL_JSON = "data/val/annotations.json"
     VAL_IMAGES = "data/val/images"
 
-    print("\n" + "=" * 60)
-    print("PIPELINE D'ENTRAÎNEMENT - SEGMENTATION UTERUS")
-    print("=" * 60)
+    DatasetValidator(TRAIN_JSON, TRAIN_IMAGES).validate_dataset()
 
-    print("\nÉTAPE 1: Validation du dataset")
-    validator = DatasetValidator(TRAIN_ANNOTATIONS, TRAIN_IMAGES)
-    validator.validate_dataset()
-
-    print("\nÉTAPE 2: Configuration du modèle")
     trainer = UterusSegmentationTrainer()
     trainer.register_datasets(
-        TRAIN_ANNOTATIONS, TRAIN_IMAGES, VAL_ANNOTATIONS, VAL_IMAGES
+        TRAIN_JSON, TRAIN_IMAGES, VAL_JSON, VAL_IMAGES
     )
-    
-    print(f"  • Warmup iterations: {trainer.cfg.SOLVER.WARMUP_ITERS}")
-    print(f"  • Warmup factor: {trainer.cfg.SOLVER.WARMUP_FACTOR}")
 
-    print("\nÉTAPE 3: Entraînement du modèle")
     trainer_instance = trainer.train()
 
-    # Sauvegarder la config
-    config_path = Path("output/config.yaml")
-    with config_path.open("w", encoding="utf-8") as fh:
-        fh.write(trainer.cfg.dump())
+    with open("output/config.yaml", "w") as f:
+        f.write(trainer.cfg.dump())
 
-    print("\n" + "=" * 60)
-    print("✅ PIPELINE TERMINÉ AVEC SUCCÈS !")
-    print("=" * 60)
-    print(f"\n📁 Modèle sauvegardé dans: {trainer.cfg.OUTPUT_DIR}")
-    print(f"📄 Configuration: {config_path}")
-    
     return trainer_instance, {}
 
 
 if __name__ == "__main__":
-    trainer, results = main_training_pipeline()
-    
-    print("\n" + "=" * 60)
-    print("TEST D'INFÉRENCE")
-    print("=" * 60)
-    
-    inference = UterusSegmentationInference(
-        model_path="output/model_best_dice.pth",
-        config_path="output/config.yaml",
-    )
-    
-    sample_image = Path("data/test/images/sample.jpg")
-    if sample_image.exists():
-        test_result = inference.segment_image(sample_image)
-        print(f"✅ Détections: {test_result['num_detections']}")
-        if test_result["scores"].size:
-            print(f"📊 Score max: {test_result['scores'].max():.3f}")
-    else:
-        print("⚠️ Aucune image 'sample.jpg' trouvée dans data/test/images")
+    main_training_pipeline()
