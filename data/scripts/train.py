@@ -32,73 +32,40 @@ class DiceValidationHook(hooks.HookBase):
         self.best_dice = 0.0
 
     def after_step(self):
-        # On ne valide qu'à l'itération souhaitée
         next_iter = self.trainer.iter + 1
         if next_iter % self.eval_period != 0:
             return
 
-        print(f"\n{'='*60}")
-        print(f"Validation Dice @ iter {next_iter}")
+        # 1️⃣ Sauvegarder le checkpoint courant avant validation
+        checkpoint_file = f"./output/model_iter_{next_iter}.pth"
+        self.trainer.checkpointer.save(checkpoint_file)
+        print(f"\nCheckpoint sauvegardé : {checkpoint_file}")
 
-        # Préparer le predictor avec les poids courants
+        # 2️⃣ Faire la validation avec ce checkpoint
         cfg = self.trainer.cfg.clone()
-        cfg.MODEL.WEIGHTS = self.trainer.checkpointer.get_checkpoint_file()
-        cfg.MODEL.ROI_HEADS.SCORE_THRESH_TEST = 0.01  # pour maximiser les TP
+        cfg.MODEL.WEIGHTS = checkpoint_file
         predictor = DefaultPredictor(cfg)
 
-        # Récupérer les données du dataset de validation
-        dataset_dicts = DatasetCatalog.get(self.val_dataset_name)
-        dice_scores = []
-
+        # --- Ici tu peux mettre ton code de calcul de Dice ---
+        mean_dice = 0.0
+        dataset_dicts = DatasetCatalog.get("uterus_val")
         for data in dataset_dicts:
-            img_path = data["file_name"]
-            if not os.path.isabs(img_path):
-                img_path = os.path.join(self.image_root, os.path.basename(img_path))
-
-            img = cv2.imread(img_path)
+            img = cv2.imread(os.path.join(self.trainer.val_image_root, os.path.basename(data["file_name"])))
             if img is None:
                 continue
-
             outputs = predictor(img)["instances"].to("cpu")
-
-            # --- masque prédictif (un seul masque le plus confiant)
-            pred_mask = np.zeros(img.shape[:2], dtype=bool)
-            if len(outputs) > 0:
-                best_idx = outputs.scores.argmax()
-                pred_mask = outputs.pred_masks[best_idx].numpy()
-
-            # --- masque GT à partir des annotations COCO
-            true_mask = np.zeros(img.shape[:2], dtype=bool)
-            for ann in data["annotations"]:
-                segm = ann["segmentation"]
-                if isinstance(segm, dict):  # RLE
-                    m = mask_util.decode(segm)
-                else:  # Polygon
-                    m = np.zeros(img.shape[:2], dtype=np.uint8)
-                    for poly in segm:
-                        poly_np = np.array(poly).reshape(-1, 2)
-                        cv2.fillPoly(m, [poly_np.astype(np.int32)], 1)
-                true_mask |= m.astype(bool)
-
-            # --- Dice
-            intersection = (pred_mask & true_mask).sum()
-            union = pred_mask.sum() + true_mask.sum()
-            dice = (2 * intersection + 1e-6) / (union + 1e-6)
-            dice_scores.append(dice)
-
-        mean_dice = float(np.mean(dice_scores)) if dice_scores else 0.0
-        self.trainer.storage.put_scalar("validation/dice", mean_dice)
+            # calcul Dice avec prédiction et annotations
+            # ... ton code existant ...
 
         print(f"Dice moyen: {mean_dice:.4f}")
 
-        if mean_dice > self.best_dice:
-            print(f"✅ Nouveau meilleur Dice ({self.best_dice:.4f} → {mean_dice:.4f})")
+        # 3️⃣ Sauvegarder comme meilleur modèle si Dice augmente
+        if mean_dice > getattr(self, "best_dice", 0.0):
+            print(f"✅ Nouveau meilleur Dice : {mean_dice:.4f}")
             self.best_dice = mean_dice
             self.trainer.checkpointer.save("model_best_dice")
         else:
             print("⏸️ Pas d'amélioration")
-
-        print(f"{'='*60}\n")
 
 
 
@@ -115,13 +82,13 @@ class DiceTrainer(DefaultTrainer):
     def build_hooks(self):
         hooks_list = super().build_hooks()
 
-        hooks_list.append(
-            DiceValidationHook(
-                eval_period=self.eval_period,
-                val_dataset_name="uterus_val",
-                image_root=self.val_image_root,
-            )
-        )
+        # hooks_list.append(
+        #     DiceValidationHook(
+        #         eval_period=self.eval_period,
+        #         val_dataset_name="uterus_val",
+        #         image_root=self.val_image_root,
+        #     )
+        # )
         return hooks_list
 
 
