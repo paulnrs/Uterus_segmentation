@@ -44,36 +44,33 @@ class DiceValidationHook(hooks.HookBase):
         dice_scores = []
 
         for data in dataset_dicts:
+            # --- Gestion du chemin de l'image ---
             img_path = data["file_name"]
-
-            # Si le chemin n'est pas absolu ou le fichier n'existe pas, on complète avec image_root
             if not os.path.isabs(img_path) or not os.path.exists(img_path):
                 img_path_candidate = os.path.join(self.image_root, os.path.basename(img_path))
                 if os.path.exists(img_path_candidate):
                     img_path = img_path_candidate
 
-            # Si le fichier est toujours introuvable, on ignore cette image
             if not os.path.exists(img_path):
                 print(f"⚠️ Image introuvable, ignorée : {data['file_name']}")
                 continue
 
-            img = cv2.imread(img_path)
-
+            # --- Lecture de l'image ---
             img = cv2.imread(img_path)
             if img is None:
-                print(f"⚠️ Image introuvable, ignorée : {data['file_name']}")
+                print(f"⚠️ Impossible de lire l'image : {data['file_name']}")
                 continue
 
-            # --- prédiction ---
+            # --- Prédiction ---
             outputs = self.predictor_instance(img)["instances"].to("cpu")
 
-            # Masque de prédiction
+            # --- Masque prédictif ---
             pred_mask = np.zeros(img.shape[:2], dtype=bool)
             if len(outputs) > 0:
                 for m in outputs.pred_masks.numpy():
                     pred_mask |= m
 
-            # Masque vrai
+            # --- Masque vrai ---
             true_mask = np.zeros(img.shape[:2], dtype=bool)
             for ann in data["annotations"]:
                 segm = ann["segmentation"]
@@ -86,7 +83,7 @@ class DiceValidationHook(hooks.HookBase):
                         cv2.fillPoly(m, [poly_np.astype(np.int32)], 1)
                 true_mask |= m.astype(bool)
 
-            # --- REDIMENSIONNEMENT du masque vrai pour correspondre au prédictif ---
+            # --- Redimensionner le masque vrai pour correspondre au prédictif ---
             pred_h, pred_w = pred_mask.shape
             true_mask_resized = cv2.resize(
                 true_mask.astype(np.uint8),
@@ -94,12 +91,13 @@ class DiceValidationHook(hooks.HookBase):
                 interpolation=cv2.INTER_NEAREST
             ).astype(bool)
 
-            # Dice
+            # --- Calcul du Dice ---
             intersection = (pred_mask & true_mask_resized).sum()
             union = pred_mask.sum() + true_mask_resized.sum()
             dice = (2 * intersection) / union if union > 0 else 1.0
             dice_scores.append(dice)
 
+        # --- Moyenne Dice ---
         mean_dice = float(np.mean(dice_scores)) if dice_scores else 0.0
         self.trainer.storage.put_scalar("validation/dice_score", mean_dice)
 
@@ -113,6 +111,7 @@ class DiceValidationHook(hooks.HookBase):
             print("⏸️ Pas d'amélioration")
 
         print(f"{'='*60}\n")
+
 
 
 
