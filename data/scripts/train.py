@@ -55,20 +55,22 @@ class DiceValidationHook(hooks.HookBase):
 
         with torch.no_grad():
             for data in tqdm(dataset_dicts, desc="Validation Dice"):
-                # Construire le chemin - gérer les chemins absolus et relatifs
                 file_name = data["file_name"]
                 
-                # Si le file_name contient déjà le chemin complet, l'utiliser directement
-                if os.path.isabs(file_name) or file_name.startswith("data/"):
+                # Stratégie de construction du chemin
+                if self.image_root == "":
+                    # Les file_name sont déjà complets
                     img_path = file_name
                 else:
-                    # Sinon, ajouter le image_root
-                    img_path = os.path.join(self.image_root, file_name)
+                    # Utiliser basename pour éviter les doublons de chemin
+                    img_path = os.path.join(self.image_root, os.path.basename(file_name))
                 
                 img = cv2.imread(img_path)
                 
                 if img is None:
-                    print(f"⚠️ Image introuvable: {img_path}")
+                    print(f"⚠️ Image introuvable:")
+                    print(f"   file_name: {file_name}")
+                    print(f"   img_path: {img_path}")
                     continue
 
                 # Convertir BGR → RGB si nécessaire
@@ -382,6 +384,20 @@ class UterusSegmentationTrainer:
     def register_datasets(
         self, train_json: str, train_imgs: str, val_json: str, val_imgs: str
     ) -> None:
+        print("\n" + "="*60)
+        print("🔍 DIAGNOSTIC DES CHEMINS")
+        print("="*60)
+        
+        # Vérifier les fichiers JSON
+        print(f"\n📄 Fichiers JSON:")
+        print(f"  Train: {train_json} {'✅' if Path(train_json).exists() else '❌ INTROUVABLE'}")
+        print(f"  Val:   {val_json} {'✅' if Path(val_json).exists() else '❌ INTROUVABLE'}")
+        
+        # Vérifier les dossiers d'images
+        print(f"\n📁 Dossiers d'images:")
+        print(f"  Train: {train_imgs} {'✅' if Path(train_imgs).exists() else '❌ INTROUVABLE'}")
+        print(f"  Val:   {val_imgs} {'✅' if Path(val_imgs).exists() else '❌ INTROUVABLE'}")
+        
         # Nettoyer les anciens datasets
         for name in ("uterus_train", "uterus_val"):
             try:
@@ -397,14 +413,92 @@ class UterusSegmentationTrainer:
         self.cfg.DATASETS.TRAIN = ("uterus_train",)
         self.cfg.DATASETS.VAL = ("uterus_val",)
         
-        # Stocker le chemin des images de validation
-        self.val_image_root = val_imgs
+        # DIAGNOSTIC APPROFONDI du dataset de validation
+        print(f"\n🔬 Inspection du dataset de validation:")
+        val_dicts = DatasetCatalog.get("uterus_val")
+        
+        if len(val_dicts) == 0:
+            print("  ❌ ERREUR: Dataset vide!")
+            return
+        
+        print(f"  Nombre d'images: {len(val_dicts)}")
+        
+        # Examiner le premier fichier
+        first_file = val_dicts[0]
+        file_name = first_file["file_name"]
+        
+        print(f"\n  Premier fichier:")
+        print(f"    file_name (JSON): '{file_name}'")
+        print(f"    Type: {'Chemin absolu' if os.path.isabs(file_name) else 'Chemin relatif'}")
+        print(f"    Commence par 'data/': {file_name.startswith('data/')}")
+        
+        # Tester différentes combinaisons de chemins
+        print(f"\n  Tests de chemins:")
+        
+        # Test 1: file_name tel quel
+        test1 = file_name
+        exists1 = os.path.exists(test1)
+        print(f"    1. '{test1}' → {'✅ EXISTE' if exists1 else '❌ INTROUVABLE'}")
+        
+        # Test 2: image_root + file_name
+        test2 = os.path.join(val_imgs, file_name)
+        exists2 = os.path.exists(test2)
+        print(f"    2. '{test2}' → {'✅ EXISTE' if exists2 else '❌ INTROUVABLE'}")
+        
+        # Test 3: Extraire juste le nom de fichier
+        test3 = os.path.join(val_imgs, os.path.basename(file_name))
+        exists3 = os.path.exists(test3)
+        print(f"    3. '{test3}' → {'✅ EXISTE' if exists3 else '❌ INTROUVABLE'}")
+        
+        # Décider quelle stratégie utiliser
+        print(f"\n  📌 Stratégie choisie:")
+        if exists1:
+            print(f"    ✅ Utiliser file_name tel quel (déjà complet)")
+            self.val_image_root = ""
+        elif exists3:
+            print(f"    ✅ Utiliser basename(file_name) + image_root")
+            self.val_image_root = val_imgs
+            print(f"    ⚠️  ATTENTION: vos file_name contiennent des chemins qui seront ignorés")
+        elif exists2:
+            print(f"    ✅ Utiliser image_root + file_name")
+            self.val_image_root = val_imgs
+        else:
+            print(f"    ❌ ERREUR: Aucune stratégie ne fonctionne!")
+            print(f"    💡 Vérifiez que vos images sont bien dans '{val_imgs}'")
+            self.val_image_root = val_imgs
+        
+        # Compter combien de fichiers existent réellement
+        print(f"\n  🔍 Vérification complète...")
+        existing_count = 0
+        missing_files = []
+        
+        for i, d in enumerate(val_dicts[:10]):  # Vérifier les 10 premiers
+            fn = d["file_name"]
+            if self.val_image_root == "":
+                path = fn
+            else:
+                path = os.path.join(self.val_image_root, os.path.basename(fn))
+            
+            if os.path.exists(path):
+                existing_count += 1
+            else:
+                missing_files.append(fn)
+        
+        print(f"    Échantillon (10 premiers): {existing_count}/10 fichiers trouvés")
+        if missing_files:
+            print(f"    Fichiers manquants:")
+            for mf in missing_files[:3]:
+                print(f"      - {mf}")
+        
+        print(f"\n  ✅ image_root final: '{self.val_image_root}'")
         
         # Métadonnées
         MetadataCatalog.get("uterus_train").set(thing_classes=["uterus"])
         MetadataCatalog.get("uterus_val").set(thing_classes=["uterus"])
         
+        print("\n" + "="*60)
         print("✅ Datasets enregistrés avec succès")
+        print("="*60 + "\n")
 
     def train(self):
         print("\n" + "=" * 60)
