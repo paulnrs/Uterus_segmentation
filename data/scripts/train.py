@@ -66,8 +66,17 @@ class DiceValidationHook(hooks.HookBase):
 
                     # GT
                     true_mask = np.zeros(img.shape[:2], dtype=bool)
-                    for ann in inp["instances"].gt_masks.tensor:
-                        true_mask |= ann.numpy()
+                    for ann in inp["annotations"]:  # ou inp["instances"] si train loader
+                        segm = ann["segmentation"]
+                        if isinstance(segm, dict):  # RLE
+                            m = mask_util.decode(segm)
+                        else:  # Polygon
+                            m = np.zeros(img.shape[:2], dtype=np.uint8)
+                            for poly in segm:
+                                poly_np = np.array(poly).reshape(-1, 2)
+                                cv2.fillPoly(m, [poly_np.astype(np.int32)], 1)
+                        true_mask |= m.astype(bool)
+
 
                     intersection = (pred_mask & true_mask).sum()
                     union = pred_mask.sum() + true_mask.sum()
