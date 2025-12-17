@@ -44,23 +44,25 @@ class DiceValidationHook(hooks.HookBase):
         dice_scores = []
 
         for data in dataset_dicts:
-    # Si le JSON est standard, juste concaténer file_name
-            if os.path.isabs(data["file_name"]) or "data/val/images" in data["file_name"]:
-                img_path = data["file_name"]
-            else:
-                img_path = os.path.join(self.image_root, data["file_name"])
+            img_path = data["file_name"]
+            if not os.path.isabs(img_path):
+                img_path = os.path.join(self.image_root, img_path)
+
             img = cv2.imread(img_path)
             if img is None:
                 print(f"⚠️ Image introuvable, ignorée : {data['file_name']}")
                 continue
 
+            # --- prédiction ---
             outputs = self.predictor_instance(img)["instances"].to("cpu")
 
+            # Masque de prédiction
             pred_mask = np.zeros(img.shape[:2], dtype=bool)
             if len(outputs) > 0:
                 for m in outputs.pred_masks.numpy():
                     pred_mask |= m
 
+            # Masque vrai
             true_mask = np.zeros(img.shape[:2], dtype=bool)
             for ann in data["annotations"]:
                 segm = ann["segmentation"]
@@ -73,8 +75,17 @@ class DiceValidationHook(hooks.HookBase):
                         cv2.fillPoly(m, [poly_np.astype(np.int32)], 1)
                 true_mask |= m.astype(bool)
 
-            intersection = (pred_mask & true_mask).sum()
-            union = pred_mask.sum() + true_mask.sum()
+            # --- REDIMENSIONNEMENT du masque vrai pour correspondre au prédictif ---
+            pred_h, pred_w = pred_mask.shape
+            true_mask_resized = cv2.resize(
+                true_mask.astype(np.uint8),
+                (pred_w, pred_h),
+                interpolation=cv2.INTER_NEAREST
+            ).astype(bool)
+
+            # Dice
+            intersection = (pred_mask & true_mask_resized).sum()
+            union = pred_mask.sum() + true_mask_resized.sum()
             dice = (2 * intersection) / union if union > 0 else 1.0
             dice_scores.append(dice)
 
